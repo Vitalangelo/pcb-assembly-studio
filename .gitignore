@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Generated output
+*.pdf
+!docs/**/*.pdf
+
+# EDA working files - never commit customer designs
+*.gbr
+*.gtl
+*.gbl
+*.gto
+*.gbo
+*.gts
+*.gbs
+*.gtp
+*.gbp
+*.gko
+*.gm[0-9]
+*.g[0-9]
+*.drl
+*.pos
+*.dwg
+*.dxf
+*_gerber.zip
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.bak

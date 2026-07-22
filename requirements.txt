@@ -1,0 +1,11 @@
+# Core - required
+matplotlib>=3.7        # PDF rendering
+gerbonara>=1.0         # Gerber parsing
+
+# Optional - the app degrades gracefully without these
+openpyxl>=3.1          # read .xlsx BOM files
+ezdxf>=1.1             # DXF board artwork
+tkinterdnd2>=0.4       # drag-and-drop file import
+
+# Note: tkinter ships with CPython on Windows and macOS.
+# On Debian/Ubuntu install it separately:  sudo apt install python3-tk
