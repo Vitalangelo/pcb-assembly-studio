@@ -5,6 +5,11 @@ assembly drawings**. Interactive board viewer, print-ready PDF export.
 
 **100% offline.** Everything is parsed on your machine. No uploads, no network calls.
 
+![One page of a generated assembly drawing — components colour-coded by group, with a matching legend table](docs/assembly-drawing.png)
+
+*One page of the exported PDF. Each group gets a colour, so every 12K resistor on
+the board is found by looking instead of reading designators.*
+
 ---
 
 ## 📥 Download
@@ -60,6 +65,8 @@ solder mask, `.GM1`–`.GM4`/`.GKO` outline. Cyrillic filenames inside the ZIP a
 ---
 
 ## 🖥️ What You Get
+
+![The viewer window: board on the left, colour-coded legend with quantities and designators on the right](docs/viewer.png)
 
 **Viewer** — scroll to zoom, drag to pan. Gerber artwork as the background, colored
 component highlights, pin-1 markers on ICs, bottom layer auto-mirrored.
