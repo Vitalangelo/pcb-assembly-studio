@@ -7,6 +7,7 @@ Standalone GUI - packaged to .exe via PyInstaller.
 """
 
 import csv
+import datetime
 import io
 import math
 import os
@@ -54,7 +55,57 @@ PREFIX_ORDER = {
     "F": 30, "J": 31, "X": 32, "P": 33, "S": 40, "SW": 40,
 }
 
-APP_VERSION = "1.0"
+APP_VERSION = "1.1"
+
+# ---------------------------------------------------------------------------
+#  ISO drawing sheet - geometry, line widths, lettering
+#  ISO 5457:1999  sheet sizes and layout      ISO 7200:2004  title block fields
+#  ISO 7573:2008  parts lists                 ISO 6433:2012  part references
+#  ISO 128-20     lines                       ISO 3098-1     lettering
+#  ISO 5455       scales
+# ---------------------------------------------------------------------------
+
+# ISO 5457:1999 table 1 - trimmed sheet, (short side, long side) in mm
+SHEET_SIZES = {"A4": (210.0, 297.0), "A3": (297.0, 420.0), "A2": (420.0, 594.0)}
+
+# ISO 5457:1999 table 2 gives the field counts (A4 6/4, A3 8/6, A2 12/8).
+# grid_edges() reproduces them from the 50 mm rule, so they are not tabulated.
+
+# ISO 5457:1999 4.2 - the 20 mm left border doubles as the filing margin
+BORDER_LEFT = 20.0
+BORDER_EDGE = 10.0
+ZONE_STRIP = 5.0            # width of the grid reference border
+GRID_FIELD_LEN = 50.0       # ISO 5457:1999 4.4 - corner fields take the remainder
+# I and O are skipped - they read as 1 and 0 (ISO 5457:1999 4.4)
+ZONE_LETTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ"
+
+TITLE_BLOCK_W = 180.0       # ISO 7200:2004 clause 6 - fills the A4 drawing space
+TITLE_BLOCK_H = 36.0
+CAPTION_H = 7.0             # strip above the view for its caption and scale
+
+# ISO 128-20 line widths in mm; wide:narrow is 2:1
+LW_FRAME, LW_WIDE, LW_NARROW, LW_FINE = 0.7, 0.5, 0.35, 0.25
+
+# ISO 3098-1 5.3 lettering heights in mm - the sqrt(2) ladder
+H_MICRO, H_SMALL, H_MID, H_BIG = 1.8, 2.5, 3.5, 5.0
+
+# ISO 5455 recommended scales, largest first
+ISO_SCALES = [(50, 1), (20, 1), (10, 1), (5, 1), (2, 1), (1, 1),
+              (1, 2), (1, 5), (1, 10), (1, 20), (1, 50), (1, 100)]
+
+PT_PER_MM = 72.0 / 25.4     # matplotlib measures in points, the sheet in millimetres
+CAP_RATIO = 0.70            # cap height / em size of the default sans font
+
+
+def mm_font(h_mm):
+    """ISO 3098 lettering height (cap height, mm) -> matplotlib font size in pt."""
+    return h_mm * PT_PER_MM / CAP_RATIO
+
+
+def mm_lw(w_mm):
+    """ISO 128-20 line width (mm) -> matplotlib linewidth in pt."""
+    return w_mm * PT_PER_MM
+
 
 # ---------------------------------------------------------------------------
 #  Output localisation
@@ -67,23 +118,61 @@ LANG = "en"
 _STRINGS = {
     "en": {
         "cell": "Cell",
-        "refdes": "Ref. Des",
+        "refdes": "Ref. designation",
         "description": "Description",
         "qty": "Qty.",
         "note": "Note",
         "key": "Key",
         "dni_short": "DNI",
-        "dni_page": "- DO NOT INSTALL / DNI",
+        "dni_page": "DO NOT INSTALL / DNI",
+        "item": "Item",
+        "part_no": "Part number",
+        "tech_data": "Technical data",
+        "package": "Package",
+        "remarks": "Remarks",
+        "tb_owner": "Legal owner",
+        "tb_doctype": "Document type",
+        "tb_creator": "Created by",
+        "tb_approver": "Approved by",
+        "tb_date": "Date of issue",
+        "tb_docno": "Identification no.",
+        "tb_rev": "Rev.",
+        "tb_scale": "Scale",
+        "tb_lang": "Lang.",
+        "tb_sheet": "Sheet",
+        "tb_title": "Title",
+        "doctype_value": "Assembly drawing",
+        "view_top": "TOP SIDE",
+        "view_bottom": "BOTTOM SIDE (MIRRORED)",
     },
     "ru": {
-        "cell": "\u042f\u0447\u0435\u0439\u043a\u0430 / Cell",
-        "refdes": "\u041f\u043e\u0437. \u043e\u0431\u043e\u0437\u043d\u0430\u0447\u0435\u043d\u0438\u0435 / Ref. Des",
-        "description": "\u041e\u043f\u0438\u0441\u0430\u043d\u0438\u0435 / Description",
-        "qty": "\u041a\u043e\u043b. / Qty.",
-        "note": "\u041f\u0440\u0438\u043c. / Note",
-        "key": "\u041a\u043b\u044e\u0447 / Key",
-        "dni_short": "\u041d\u0415 \u0423\u0421\u0422\u0410\u041d.",
-        "dni_page": "\u00b7 \u041d\u0415 \u0423\u0421\u0422\u0410\u041d\u0410\u0412\u041b\u0418\u0412\u0410\u0422\u042c / DNI",
+        "cell": "Ячейка / Cell",
+        "refdes": "Поз. обозначение / Ref. designation",
+        "description": "Описание / Description",
+        "qty": "Кол. / Qty.",
+        "note": "Прим. / Note",
+        "key": "Ключ / Key",
+        "dni_short": "НЕ УСТАН.",
+        "dni_page": "НЕ УСТАНАВЛИВАТЬ / DNI",
+        "item": "Поз. / Item",
+        "part_no": "Тип / Part number",
+        "tech_data": "Техн. данные / Technical data",
+        "package": "Корпус / Package",
+        "remarks": "Примечание / Remarks",
+        "tb_owner": "Владелец / Legal owner",
+        "tb_doctype": "Тип документа / Document type",
+        "tb_creator": "Разработал / Created by",
+        "tb_approver": "Утвердил / Approved by",
+        "tb_date": "Дата выпуска / Date of issue",
+        "tb_docno": "Обозначение / Identification no.",
+        "tb_rev": "Изм. / Rev.",
+        "tb_scale": "Масштаб / Scale",
+        "tb_lang": "Язык / Lang.",
+        "tb_sheet": "Лист / Sheet",
+        "tb_title": "Наименование / Title",
+        "doctype_value": "Сборочный чертёж / Assembly drawing",
+        "view_top": "ВИД СВЕРХУ / TOP SIDE",
+        "view_bottom": "ВИД СНИЗУ, ЗЕРКАЛЬНО / BOTTOM SIDE (MIRRORED)",
     },
 }
 STR = _STRINGS[LANG]
@@ -100,6 +189,16 @@ HOLE_PATTERNS = re.compile(
     r"\b(HOLE|MOUNT(?:ING)?|FIDUCIAL|ОТВЕРСТ\w*|КРЕП\w*|РЕПЕР\w*)\b", re.I)
 
 SKIP_PREFIXES = {"TP", "MH", "FID"}
+
+# A Comment or Value consisting of nothing but one of these means the part is
+# not fitted - a KiCad habit. The match has to be against the WHOLE field: a
+# word-boundary search would also fire on "100 nF" and "4.7 nF", quietly
+# marking every spaced nanofarad capacitor as do-not-install.
+NOT_FITTED_EXACT = {"nf", "dnf"}
+
+
+def is_not_fitted(*fields):
+    return any(str(f or "").strip().lower() in NOT_FITTED_EXACT for f in fields)
 
 
 def normalize_layer(raw):
@@ -163,13 +262,17 @@ class Component:
     h: float = 0.8
     shape: str = "rect"
     dni: bool = False
+    footprint: str = ""
 
     def __post_init__(self):
         self.prefix = extract_prefix(self.designator)
         self._estimate_size()
 
     def _estimate_size(self):
-        desc = (self.description + " " + self.comment).upper()
+        # The footprint name is the most reliable size hint a BOM offers:
+        # "USON-10_2.5x1.0mm_P0.5mm" beats guessing from a marketing blurb.
+        desc = (self.description + " " + self.comment + " "
+                + self.footprint).upper()
         prefix = self.prefix
         if prefix == "TP":
             self.w, self.h, self.shape = 1.0, 1.0, "circle"; return
@@ -230,6 +333,9 @@ class ComponentGroup:
     quantity: int
     note: str = ""
     dni: bool = False
+    footprint: str = ""
+    part_no: str = ""
+    tech: str = ""
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -708,8 +814,12 @@ def _classify_dxf_layers(entities_by_layer):
 
 
 def render_board_entities(ax, entities, color="#555555", linewidth=0.3,
-                          alpha=0.7, mirror_x=0):
-    """Render board entities (from Gerber or DXF) on matplotlib axes."""
+                          alpha=0.7, mirror_x=0, scale=1.0):
+    """Render board entities (from Gerber or DXF) on matplotlib axes.
+
+    `scale` is paper millimetres per board millimetre: Gerber aperture widths
+    are real board dimensions, so they have to be converted to points through
+    the drawing scale rather than used as if they were already points."""
     import matplotlib.patches as mpatches
 
     def mx(x):
@@ -724,7 +834,7 @@ def render_board_entities(ax, entities, color="#555555", linewidth=0.3,
                     x1, y1, x2, y2, w = data
                 else:
                     x1, y1, x2, y2 = data; w = 0.1
-                lw = max(0.1, min(w * 0.8, 1.5))
+                lw = max(0.08, min(w * scale * PT_PER_MM, 1.2))
                 ax.plot([mx(x1), mx(x2)], [y1, y2], color=color,
                        linewidth=lw, alpha=alpha, zorder=1, solid_capstyle="round")
 
@@ -752,7 +862,7 @@ def render_board_entities(ax, entities, color="#555555", linewidth=0.3,
                 r = math.sqrt((x1 - cx)**2 + (y1 - cy)**2)
                 if r < 0.001: continue
                 is_full = abs(x1-x2) < 0.001 and abs(y1-y2) < 0.001
-                lw = max(0.1, min(w * 0.8, 1.5))
+                lw = max(0.08, min(w * scale * PT_PER_MM, 1.2))
                 if is_full:
                     # Full circle
                     from matplotlib.patches import Circle as MplCircle
@@ -822,21 +932,71 @@ def _bom_cols(header):
         "desig": col("designator"),
         "layer": col("layer", "side"),
         "val": col("val", "value"),
+        # Altium calls it Footprint or Pattern, KiCad Footprint, some
+        # in-house exports Package - all mean the same column.
+        "footprint": col("footprint", "package", "pattern", contains="footprint"),
+        "part_no": col("part number", "partnumber", "part no", "mpn",
+                       "manufacturer part number"),
     }
 
 
-def _bom_row_to_result(comment, desc, val, desig_str, layer_raw):
+# Trailing footprint tokens that describe how the pads are drawn rather than
+# what the part is: pitch, pad/mask/exposed-pad geometry, mounting variants,
+# and the metric code that merely repeats the imperial one (0402 = 1005Metric).
+_FP_NOISE = re.compile(
+    r"^(?:\d{3,4}metric"
+    r"|p[\d.]+mm"
+    r"|(?:pad|mask|ep)[\d.x]*mm"
+    r"|handsolder|thermalvias|horizontal|vertical|nominal|castellated"
+    r"|pin1\w*)$", re.I)
+
+
+def short_package(fp):
+    """Trim a footprint name down to the part an assembler needs to read.
+
+    Library names carry the whole pad geometry - "SOIC-8-1EP_3.9x4.9mm_P1.27mm_
+    EP2.95x4.9mm_Mask2.71x3.4mm_ThermalVias" - which is unreadable in a table
+    cell. Trailing tokens that only describe the pads are dropped, which leaves
+    the package and its body size. Names whose meaning sits in a later token,
+    such as "Crystal_SMD_HC49-SD", survive intact.
+    """
+    fp = str(fp or "").strip().strip('"')
+    parts = fp.split("_")
+    while len(parts) > 1 and _FP_NOISE.match(parts[-1]):
+        parts.pop()
+    return "_".join(parts)
+
+
+# Values that occupy a Part Number cell without naming a part. Altium writes
+# "[NoParam], OPA2180IDGK" when a variant leaves the parameter unset.
+_PN_PLACEHOLDER = re.compile(r"^(?:generic|\[?noparam\]?|n/?a|none|-+|\*)$", re.I)
+
+
+def _clean_pn(part_no, comment):
+    """Manufacturer part number, or the Comment when the BOM has none."""
+    for token in str(part_no or "").split(","):
+        token = token.strip()
+        if token and not _PN_PLACEHOLDER.match(token):
+            return token
+    return comment or ""
+
+
+def _bom_row_to_result(comment, desc, val, desig_str, layer_raw, footprint="",
+                       part_no=""):
     desigs = [d.strip() for d in re.split(r"[,;]", desig_str) if d.strip()]
     if not desigs:
         return None
     layer = normalize_layer(layer_raw) if layer_raw else "Top"
     blob = f"{comment} {val} {desc}"
-    is_dni = bool(DNI_PATTERNS.search(blob))
+    is_dni = bool(DNI_PATTERNS.search(blob)) or is_not_fitted(comment, val)
     display = val if (val and not DNI_PATTERNS.search(val)) else (comment or "")
     full_desc = desc if desc and len(desc) < 60 else (display or comment)
     return {"comment": comment, "description": desc, "display": display,
-            "full_desc": full_desc, "designators": desigs,
-            "layer": layer, "dni": is_dni}
+            "full_desc": full_desc, "designators": desigs, "layer": layer,
+            "dni": is_dni, "footprint": footprint,
+            "part_no": _clean_pn(part_no, display or comment),
+            # A Description that runs long is a datasheet blurb, not table data
+            "tech": desc if desc and len(desc) < 60 else ""}
 
 
 def parse_bom_txt(filepath):
@@ -862,7 +1022,8 @@ def parse_bom_txt(filepath):
         if not desig_str:
             continue
         r = _bom_row_to_result(cell(c["comment"]), cell(c["desc"]),
-                               cell(c["val"]), desig_str, cell(c["layer"]))
+                               cell(c["val"]), desig_str, cell(c["layer"]),
+                               cell(c["footprint"]), cell(c["part_no"]))
         if r:
             results.append(r)
     return results
@@ -889,7 +1050,8 @@ def parse_bom_excel(filepath):
         if not desig_str:
             continue
         r = _bom_row_to_result(cell(c["comment"]), cell(c["desc"]),
-                               cell(c["val"]), desig_str, cell(c["layer"]))
+                               cell(c["val"]), desig_str, cell(c["layer"]),
+                               cell(c["footprint"]), cell(c["part_no"]))
         if r:
             results.append(r)
     return results
@@ -925,6 +1087,7 @@ def group_from_bom(bom_rows, pnp):
                 comp = pnp[d]
                 comp.comment = row["comment"]
                 comp.description = row["description"]
+                comp.footprint = row["footprint"]
                 comp.dni = row["dni"]
                 comp._estimate_size()
                 per_layer[comp.layer].append(d)
@@ -936,7 +1099,9 @@ def group_from_bom(bom_rows, pnp):
             by_layer[layer].append(ComponentGroup(
                 comment=row["comment"], description=row["full_desc"],
                 designators=ds, quantity=len(ds),
-                note=STR["key"] if is_keyed else "", dni=row["dni"]))
+                note=STR["key"] if is_keyed else "", dni=row["dni"],
+                footprint=short_package(row["footprint"]),
+                part_no=row["part_no"], tech=row["tech"]))
     # Don't sort here - let the UI sort mode decide the order
     return dict(by_layer)
 
@@ -953,10 +1118,14 @@ def group_auto(pnp):
         for prefix in sorted(by_lp[layer], key=lambda p: PREFIX_ORDER.get(p, 50)):
             desigs = sorted(by_lp[layer][prefix], key=natural_sort_key)
             is_keyed = prefix in KEYED_PREFIXES
+            fps = {short_package(pnp[d].footprint) for d in desigs}
+            fps.discard("")
             groups.append(ComponentGroup(
                 comment=f"{prefix}", description=f"All {prefix} components",
                 designators=desigs, quantity=len(desigs),
-                note=STR["key"] if is_keyed else ""))
+                note=STR["key"] if is_keyed else "",
+                footprint=fps.pop() if len(fps) == 1 else "",
+                part_no=prefix))
         result[layer] = groups
     return result
 
@@ -1039,156 +1208,496 @@ def should_label(comp):
 
 
 def draw_component(ax, comp, color, alpha=1.0, label=False,
-                   mirror_x=0, linewidth=0.3, zorder=2, edge_color="#333",
-                   hatch=None):
+                   mirror_x=0, linewidth=LW_FINE, zorder=2, edge_color="#333",
+                   hatch=None, scale=1.0, key_marker=True):
     """A component on the PDF view. When mirrored (Bottom view) the ENTIRE
     geometry is flipped: rotation angle (theta -> -theta) and the pin-1 marker
     offset (dx -> -dx), not just the centre - otherwise the key points to the
-    wrong corner."""
+    wrong corner.
+
+    `scale` is paper millimetres per board millimetre, so text and markers can
+    be sized in real ISO 3098 lettering heights instead of guessed points.
+    """
     x, y = comp.x, comp.y
     mirrored = mirror_x > 0
     if mirrored:
         x = mirror_x - x
     w, h = comp.w, comp.h
+    lw = mm_lw(linewidth)
     if comp.shape == "circle":
         ax.add_patch(Circle((x, y), w/2, facecolor=color, edgecolor=edge_color,
-                           linewidth=linewidth, alpha=alpha, zorder=zorder,
+                           linewidth=lw, alpha=alpha, zorder=zorder,
                            hatch=hatch))
     else:
         angle = -comp.rotation if mirrored else comp.rotation
         ax.add_patch(Rectangle((x-w/2, y-h/2), w, h, angle=angle,
                                rotation_point="center", facecolor=color,
-                               edgecolor=edge_color, linewidth=linewidth,
+                               edgecolor=edge_color, linewidth=lw,
                                alpha=alpha, zorder=zorder, hatch=hatch))
-        if comp.shape == "ic" and alpha >= 0.6:
+        if comp.shape == "ic" and key_marker:
             rad = math.radians(comp.rotation)
             dx = (-w/2+0.6)*math.cos(rad) - (-h/2+0.6)*math.sin(rad)
             dy = (-w/2+0.6)*math.sin(rad) + (-h/2+0.6)*math.cos(rad)
             if mirrored:
                 dx = -dx
-            ax.plot(x+dx, y+dy, "o", color="white",
-                    markersize=max(2.2, min(w, h)*0.4),
+            ms = max(0.8, min(w, h) * scale * 0.35) * PT_PER_MM
+            ax.plot(x+dx, y+dy, "o", color="white", markersize=ms,
                     zorder=zorder+1, markeredgecolor="#333", markeredgewidth=0.3)
     if label and should_label(comp):
-        fs = max(2, min(5, min(w,h)*0.55))
-        ax.text(x, y, comp.designator, ha="center", va="center",
-                fontsize=fs, fontweight="bold", color="white", zorder=zorder+2,
-                path_effects=[pe.Stroke(linewidth=1.0, foreground="#333"), pe.Normal()])
+        # Cap height on paper. Below ~1.1 mm a designator is unreadable, so it
+        # is dropped rather than turned into a smudge.
+        cap = min(w, h) * scale * 0.45
+        if cap >= 1.1:
+            ax.text(x, y, comp.designator, ha="center", va="center",
+                    fontsize=mm_font(min(cap, H_MID)), fontweight="bold",
+                    color="white", zorder=zorder+2,
+                    path_effects=[pe.Stroke(linewidth=1.0, foreground="#333"),
+                                  pe.Normal()])
 
 
-def draw_board(fig, pnp, gwc, layer, bounds, board_layers=None):
+# ═══════════════════════════════════════════════════════════════════════
+#  ISO DRAWING SHEET — ISO 5457 frame, ISO 7200 title block,
+#                      ISO 7573 parts list, ISO 5455 scales
+# ═══════════════════════════════════════════════════════════════════════
+
+def _txt_w(s, h_mm):
+    """Rough width in mm of `s` at ISO lettering height h_mm.
+
+    Measured advance per character runs 0.75 h for lower case up to 0.89 h for
+    Cyrillic capitals, so the estimate is deliberately pessimistic. Anything
+    that must not overflow is measured exactly by Sheet.ftext() instead.
+    """
+    return len(s) * h_mm * 0.88
+
+
+def _wrap_mm(text, max_mm, h_mm, max_lines=2, sep=" "):
+    """Wrap `text` onto at most `max_lines` lines of `max_mm` width."""
+    budget = max(4, int(max_mm / (h_mm * 0.80)))
+    toks = str(text).split(sep)
+    lines, cur, i = [], "", 0
+    while i < len(toks) and len(lines) < max_lines:
+        cand = toks[i] if not cur else cur + sep + toks[i]
+        if len(cand) <= budget or not cur:
+            cur, i = cand, i + 1
+        else:
+            lines.append(cur)
+            cur = ""
+    if cur and len(lines) < max_lines:
+        lines.append(cur)
+        cur = ""
+    if not lines:
+        return [""]
+    if i < len(toks) or cur:        # something was left over - mark it
+        lines[-1] = lines[-1][:budget - 1].rstrip(" ,;") + "…"
+    return [ln if len(ln) <= budget else ln[:budget - 1] + "…" for ln in lines]
+
+
+def grid_edges(centre, lo, hi):
+    """Grid reference field boundaries between `lo` and `hi`.
+
+    ISO 5457:1999 4.4 - fields are 50 mm long and start at the axis of symmetry
+    of the trimmed sheet (the centring marks); the leftover at each end is
+    absorbed by the corner fields. Reproduces the field counts of table 2.
+    """
+    edges = [lo]
+    k = math.ceil((lo - centre) / GRID_FIELD_LEN)
+    v = centre + k * GRID_FIELD_LEN
+    while v < hi - 1e-6:
+        if v > lo + 1e-6:
+            edges.append(v)
+        v += GRID_FIELD_LEN
+    edges.append(hi)
+    return edges
+
+
+def sheet_layout(fmt, landscape):
+    """Millimetre geometry of one sheet: drawing space and the blocks in it.
+
+    Computed without building a figure so the drawing scale can be decided once
+    for the whole document - every sheet then shows the board at the same size.
+    """
+    short, long_ = SHEET_SIZES.get(fmt, SHEET_SIZES["A4"])
+    w, h = (long_, short) if landscape else (short, long_)
+    x0, y0 = BORDER_LEFT, BORDER_EDGE
+    x1, y1 = w - BORDER_EDGE, h - BORDER_EDGE
+    # Row height shrinks on small sheets so the board view keeps most of the page
+    rowh = 7.0
+    while (TITLE_BLOCK_H + rowh * (ROWS_PER_PAGE + 1) > 0.45 * (y1 - y0)
+           and rowh > 5.0):
+        rowh -= 0.25
+    stack = TITLE_BLOCK_H + rowh * (ROWS_PER_PAGE + 1)
+    board_y = y0 + stack + 4.0
+    return {
+        "w": w, "h": h, "x0": x0, "y0": y0, "x1": x1, "y1": y1,
+        "rowh": rowh,
+        "title_block": (x1 - TITLE_BLOCK_W, y0),
+        "parts_list": (x1 - TITLE_BLOCK_W, y0 + TITLE_BLOCK_H),
+        # The board axes stops short of the frame: the strip on top carries the
+        # view caption and the ISO 5455 scale designation.
+        "board": (x0, board_y, x1 - x0, y1 - CAPTION_H - board_y),
+        "caption": (x0, y1 - CAPTION_H / 2.0),
+    }
+
+
+def resolve_scale(board_w, board_h, area_w, area_h, mode="auto"):
+    """-> (factor, label). `factor` is paper millimetres per board millimetre.
+
+    "auto" picks the largest ISO 5455 scale that still fits the view area,
+    "fit" fills the area exactly (an intermediate scale, which ISO 5455 allows
+    when necessary), and "N:M" forces that scale.
+    """
+    if board_w > 0 and board_h > 0:
+        fit = min(area_w / board_w, area_h / board_h)
+    else:
+        fit = 1.0
+    if mode and ":" in str(mode):
+        try:
+            a, b = str(mode).split(":")
+            if float(a) > 0 and float(b) > 0:
+                return float(a) / float(b), "%s:%s" % (a.strip(), b.strip())
+        except ValueError:
+            pass
+    if mode == "fit":
+        def trim(v):
+            return ("%.2f" % v).rstrip("0").rstrip(".")
+        if fit >= 1.0:
+            return fit, "%s:1" % trim(fit)
+        return fit, "1:%s" % trim(1.0 / fit)
+    for num, den in ISO_SCALES:
+        if num / float(den) <= fit:
+            return num / float(den), "%d:%d" % (num, den)
+    num, den = ISO_SCALES[-1]
+    return num / float(den), "%d:%d" % (num, den)
+
+
+class Sheet:
+    """One ISO 5457 drawing sheet.
+
+    Everything is placed in millimetres on the trimmed sheet and the figure is
+    exactly that size, so 1 mm here is 1 mm on paper when the PDF is printed at
+    100 %. That is what makes the scale in the title block a real statement.
+    """
+
+    def __init__(self, fmt="A4", landscape=True):
+        self.fmt = fmt if fmt in SHEET_SIZES else "A4"
+        self.landscape = landscape
+        self.lay = sheet_layout(self.fmt, landscape)
+        self.w, self.h = self.lay["w"], self.lay["h"]
+        self.x0, self.y0 = self.lay["x0"], self.lay["y0"]
+        self.x1, self.y1 = self.lay["x1"], self.lay["y1"]
+        self.fig = plt.figure(figsize=(self.w / 25.4, self.h / 25.4),
+                              facecolor="white")
+        # Overlay axes across the whole sheet, 1 data unit = 1 mm. The frame,
+        # frame and tables are drawn here; the board view gets its own axes.
+        self.ov = self.fig.add_axes([0, 0, 1, 1], zorder=10)
+        self.ov.set_xlim(0, self.w)
+        self.ov.set_ylim(0, self.h)
+        self.ov.axis("off")
+        self.ov.patch.set_visible(False)
+        self._rend = None
+
+    @property
+    def designation(self):
+        """Sheet size designation for the bottom border (ISO 5457:1999 3.1)."""
+        return self.fmt
+
+    # ── primitives, all in sheet millimetres ──────────────────────────
+    def line(self, x1, y1, x2, y2, lw=LW_NARROW, color="#000"):
+        self.ov.plot([x1, x2], [y1, y2], color=color, lw=mm_lw(lw),
+                     solid_capstyle="butt")
+
+    def rect(self, x, y, w, h, lw=LW_NARROW, edge="#000", fill="none", **kw):
+        self.ov.add_patch(Rectangle((x, y), w, h, facecolor=fill,
+                                    edgecolor=edge, lw=mm_lw(lw), **kw))
+
+    def text(self, x, y, s, h=H_SMALL, ha="left", va="center", color="#000", **kw):
+        return self.ov.text(x, y, s, fontsize=mm_font(h), ha=ha, va=va,
+                            color=color, **kw)
+
+    def measure(self, s, h_mm, weight="normal"):
+        """Exact width in millimetres of `s` at lettering height h_mm."""
+        t = self.ov.text(0, 0, s, fontsize=mm_font(h_mm), fontweight=weight)
+        try:
+            if self._rend is None:
+                self._rend = self.fig.canvas.get_renderer()
+            return t.get_window_extent(renderer=self._rend).width * 25.4 / self.fig.dpi
+        finally:
+            t.remove()
+
+    def ftext(self, x, y, s, max_mm, h=H_SMALL, min_ratio=0.62, **kw):
+        """Draw `s` inside a `max_mm` wide cell.
+
+        Shrinks the lettering first - what a draughtsman does with a long name
+        in a fixed title-block cell - and only truncates when even the smallest
+        size will not fit. Widths are measured, not estimated, so bilingual
+        headers cannot silently run over their cell borders.
+        """
+        s = str(s)
+        if not s:
+            return None
+        weight = kw.get("fontweight", "normal")
+        h_min = h * min_ratio
+        w = self.measure(s, h, weight)
+        # Shrink first. Hinting makes the rendered width only roughly linear in
+        # the font size, so one scaling step can land just over the cell -
+        # iterate instead of truncating text that would have fitted.
+        for _ in range(6):
+            if w <= max_mm or h <= h_min + 1e-9:
+                break
+            h = max(h_min, h * max_mm / w * 0.98)
+            w = self.measure(s, h, weight)
+        # Only now, at the smallest allowed size, cut the text.
+        for _ in range(4):
+            if w <= max_mm or len(s) <= 1:
+                break
+            keep = max(1, int(len(s) * max_mm / w) - 1)
+            s = s[:keep].rstrip(" .,;/-") + "…"
+            w = self.measure(s, h, weight)
+        return self.text(x, y, s, h=h, **kw)
+
+    def caption(self, x, y, s):
+        """ISO 7200 style field caption: small, top-left inside its cell."""
+        return self.text(x + 1.2, y - 1.4, s, h=H_MICRO, va="top", color="#555")
+
+    def axes(self, x, y, w, h, **kw):
+        """A matplotlib axes filling the given millimetre rectangle."""
+        return self.fig.add_axes([x / self.w, y / self.h,
+                                  w / self.w, h / self.h], **kw)
+
+
+def draw_frame(sheet):
+    """ISO 5457: frame, grid reference border, centring marks, trimming marks."""
+    s = sheet
+    z = ZONE_STRIP
+    # 4.2 - frame limiting the drawing space
+    s.rect(s.x0, s.y0, s.x1 - s.x0, s.y1 - s.y0, lw=LW_FRAME)
+    # 4.4 - grid reference border
+    s.rect(s.x0 - z, s.y0 - z, (s.x1 - s.x0) + 2 * z, (s.y1 - s.y0) + 2 * z,
+           lw=LW_NARROW)
+    ex = grid_edges(s.w / 2.0, s.x0, s.x1)
+    ey = grid_edges(s.h / 2.0, s.y0, s.y1)
+    both = s.fmt != "A4"        # A4 is referenced only at the top and the right
+    for v in ex[1:-1]:
+        s.line(v, s.y1, v, s.y1 + z)
+        if both:
+            s.line(v, s.y0, v, s.y0 - z)
+    for v in ey[1:-1]:
+        s.line(s.x1, v, s.x1 + z, v)
+        if both:
+            s.line(s.x0, v, s.x0 - z, v)
+    for i in range(len(ex) - 1):                     # numerals, left to right
+        cx = (ex[i] + ex[i + 1]) / 2.0
+        s.text(cx, s.y1 + z / 2.0, str(i + 1), h=H_MID, ha="center")
+        if both:
+            s.text(cx, s.y0 - z / 2.0, str(i + 1), h=H_MID, ha="center")
+    for i in range(len(ey) - 1):                     # capitals, top downwards
+        ch = ZONE_LETTERS[i % len(ZONE_LETTERS)]
+        cy = (ey[len(ey) - 2 - i] + ey[len(ey) - 1 - i]) / 2.0
+        s.text(s.x1 + z / 2.0, cy, ch, h=H_MID, ha="center")
+        if both:
+            s.text(s.x0 - z / 2.0, cy, ch, h=H_MID, ha="center")
+    # 4.3 - centring marks on the axes of symmetry of the trimmed sheet
+    mx, my = s.w / 2.0, s.h / 2.0
+    s.line(mx, s.y1 + z, mx, s.y1 - 10, lw=LW_FRAME)
+    s.line(mx, s.y0 - z, mx, s.y0 + 10, lw=LW_FRAME)
+    s.line(s.x0 - z, my, s.x0 + 10, my, lw=LW_FRAME)
+    s.line(s.x1 + z, my, s.x1 - 10, my, lw=LW_FRAME)
+    # 4.5 - trimming marks: two overlapping 10 x 5 rectangles at every corner
+    for cx, cy, sx, sy in ((0, 0, 1, 1), (s.w, 0, -1, 1),
+                           (0, s.h, 1, -1), (s.w, s.h, -1, -1)):
+        s.rect(min(cx, cx + sx * 10), min(cy, cy + sy * 5),
+               10, 5, lw=0.0, fill="#000", edge="none")
+        s.rect(min(cx, cx + sx * 5), min(cy, cy + sy * 10),
+               5, 10, lw=0.0, fill="#000", edge="none")
+    # 3.1 - the size designation goes in the bottom border, at the right corner
+    s.text(s.x1 - 1.0, BORDER_EDGE / 4.0, s.designation, h=H_SMALL, ha="right")
+
+
+def draw_title_block(sheet, meta, page, total, sub_title, scale_txt):
+    """ISO 7200:2004 title block, 180 mm wide, bottom right of the drawing space.
+
+    Mandatory fields (tables 1-3): legal owner, identification number, date of
+    issue, sheet number, title, creator, approval person, document type.
+    Revision index, number of sheets, language code and scale are optional.
+    """
+    s = sheet
+    x, y = s.lay["title_block"]
+    W, H, L = TITLE_BLOCK_W, TITLE_BLOCK_H, 110.0
+    s.rect(x, y, W, H, lw=LW_WIDE, fill="white", zorder=2)
+    for yy in (y + 27, y + 18):
+        s.line(x, yy, x + W, yy)
+    s.line(x + L, y + 9, x + W, y + 9)
+    s.line(x + L, y, x + L, y + H)
+    s.line(x + 55, y + 18, x + 55, y + 27)
+    s.line(x + 158, y + 9, x + 158, y + 18)
+    s.line(x + 134, y, x + 134, y + 9)
+    s.line(x + 152, y, x + 152, y + 9)
+
+    def cell(cx, cy, cw, ch, cap, val, vh=H_MID, bold=False):
+        s.ftext(cx + 1.2, cy + ch - 1.4, cap, cw - 2.4, h=H_MICRO, va="top",
+                color="#555")
+        s.ftext(cx + 1.4, cy + ch * 0.30, val, cw - 2.8, h=vh,
+                fontweight="bold" if bold else "normal")
+
+    cell(x, y + 27, L, 9, STR["tb_owner"], meta.get("owner", ""), bold=True)
+    cell(x, y + 18, 55, 9, STR["tb_creator"], meta.get("designer", ""))
+    cell(x + 55, y + 18, 55, 9, STR["tb_approver"], meta.get("approver", ""))
+    cell(x + L, y + 27, W - L, 9, STR["tb_doctype"], STR["doctype_value"])
+    cell(x + L, y + 18, W - L, 9, STR["tb_date"], meta.get("date", ""))
+    cell(x + L, y + 9, 48, 9, STR["tb_docno"], meta.get("doc_no", ""))
+    cell(x + 158, y + 9, W - 158, 9, STR["tb_rev"], meta.get("edition", ""))
+    cell(x + L, y, 24, 9, STR["tb_scale"], scale_txt, bold=True)
+    cell(x + 134, y, 18, 9, STR["tb_lang"], LANG.upper())
+    cell(x + 152, y, W - 152, 9, STR["tb_sheet"], "%d / %d" % (page, total),
+         bold=True)
+    # Title and supplementary title share the tall left cell
+    s.caption(x, y + 18, STR["tb_title"])
+    s.ftext(x + 1.4, y + 9.6, meta.get("project", ""), L - 3.0, h=H_BIG,
+            fontweight="bold")
+    s.ftext(x + 1.4, y + 4.2, sub_title, L - 3.0, h=H_SMALL, color="#333")
+
+
+def draw_parts_list(sheet, gwc, rowh):
+    """ISO 7573:2008 parts list.
+
+    Columns follow 5.2.1: part reference, quantity, reference designation,
+    part number, technical data, package and remarks.
+
+    Deviation from 5.1: the header sits at the top and the items read downward.
+    The standard puts the header against the title block - which would mean
+    reading upward - but every reader of this drawing expects a table to start
+    at its heading, and 5.1 allows a top header wherever the list is not in
+    conjunction with the title block.
+    """
+    s = sheet
+    x, y = s.lay["parts_list"]
+    W = TITLE_BLOCK_W
+    cols = [0.0, 12.0, 21.0, 67.0, 99.0, 135.0, 168.0, W]   # column boundaries
+    # The grid is always full height. Pages with fewer groups leave blank rows,
+    # the way a preprinted list does, so every sheet has the same geometry.
+    total_h = rowh * (ROWS_PER_PAGE + 1)
+    head_y = y + rowh * ROWS_PER_PAGE            # bottom of the header row
+    s.rect(x, y, W, total_h, lw=LW_WIDE, fill="white", zorder=2)
+    s.line(x, head_y, x + W, head_y, lw=LW_WIDE)
+    for c in cols[1:-1]:
+        s.line(x + c, y, x + c, y + total_h)
+    for i in range(1, ROWS_PER_PAGE):
+        s.line(x, y + rowh * i, x + W, y + rowh * i)
+
+    heads = [STR["item"], STR["qty"], STR["refdes"], STR["part_no"],
+             STR["tech_data"], STR["package"], STR["remarks"]]
+    for j, head in enumerate(heads):
+        s.ftext(x + cols[j] + 1.4, head_y + rowh / 2.0, head,
+                cols[j + 1] - cols[j] - 2.8, h=H_MICRO, fontweight="bold")
+
+    for i, (group, color, num) in enumerate(gwc):
+        ry = head_y - rowh * (i + 1)             # bottom of this item row
+        mid = ry + rowh / 2.0
+        # Part reference (ISO 6433): the colour key doubles as the item cell,
+        # the number is encircled so it survives greyscale printing.
+        s.rect(x + 1.0, ry + 0.8, cols[1] - 2.0, rowh - 1.6, lw=LW_FINE,
+               fill=color, edge="#333", zorder=3,
+               hatch="///" if group.dni else None)
+        if num is not None:
+            r = min(2.4, rowh / 2.0 - 1.2)
+            s.ov.add_patch(Circle((x + cols[1] / 2.0, mid), r, facecolor="white",
+                                  edgecolor="#000", lw=mm_lw(LW_FINE), zorder=4))
+            s.text(x + cols[1] / 2.0, mid, str(num), h=H_MICRO, ha="center",
+                   fontweight="bold", zorder=5)
+        s.text(x + (cols[1] + cols[2]) / 2.0, mid, str(group.quantity),
+               h=H_SMALL, ha="center")
+        w_ref = cols[3] - cols[2] - 2.8
+        refs = _wrap_mm(", ".join(group.designators), w_ref, H_MICRO,
+                        max_lines=2 if rowh >= 6.0 else 1, sep=", ")
+        lead = (len(refs) - 1) / 2.0 * H_MICRO * 1.5
+        for k, ln in enumerate(refs):
+            s.ftext(x + cols[2] + 1.4, mid + lead - k * H_MICRO * 1.5, ln,
+                    w_ref, h=H_MICRO)
+        s.ftext(x + cols[3] + 1.4, mid, group.part_no or group.comment,
+                cols[4] - cols[3] - 2.8, h=H_SMALL)
+        s.ftext(x + cols[4] + 1.4, mid, group.tech,
+                cols[5] - cols[4] - 2.8, h=H_SMALL)
+        s.ftext(x + cols[5] + 1.4, mid, group.footprint,
+                cols[6] - cols[5] - 2.8, h=H_SMALL)
+        note = STR["dni_short"] if group.dni else group.note
+        s.ftext(x + cols[6] + 1.4, mid, note, W - cols[6] - 2.8, h=H_MICRO,
+                color="#b00020" if group.dni else "#333")
+
+
+def draw_board_view(sheet, pnp, gwc, layer, bounds, scale, scale_txt,
+                    board_layers=None):
+    """The board itself, drawn at exactly `scale` paper-mm per board-mm."""
+    bx, by, bw, bh = sheet.lay["board"]
     x_min, x_max, y_min, y_max = bounds
     mirror_x = (x_min + x_max) if layer == "Bottom" else 0
-    ax = fig.add_axes([0.04, 0.33, 0.92, 0.62])
-    ax.set_xlim(x_min-2, x_max+2); ax.set_ylim(y_min-2, y_max+2)
-    ax.set_aspect("equal"); ax.set_facecolor("white")
+    ax = sheet.axes(bx, by, bw, bh, zorder=1)
+    # Mirroring reflects about the centre of the bounds, so the centre - and
+    # therefore these limits - are the same on both sides of the board.
+    cx, cy = (x_min + x_max) / 2.0, (y_min + y_max) / 2.0
+    ax.set_xlim(cx - bw / scale / 2.0, cx + bw / scale / 2.0)
+    ax.set_ylim(cy - bh / scale / 2.0, cy + bh / scale / 2.0)
+    # No set_aspect: the axes box and the data range already have the same
+    # ratio by construction, and letting matplotlib re-fit the box would
+    # silently change the drawing scale.
+    ax.set_facecolor("white")
+    ax.set_xticks([]); ax.set_yticks([])
+    for sp in ax.spines.values():
+        sp.set_visible(False)
 
-    has_dxf = board_layers is not None
-    has_outline = bool(has_dxf and board_layers.get("outline"))
+    has_art = board_layers is not None
+    has_outline = bool(has_art and board_layers.get("outline"))
 
-    # Draw the placeholder rectangle only when there is no real outline
     if not has_outline:
-        ax.add_patch(Rectangle((x_min,y_min), x_max-x_min, y_max-y_min,
-                               facecolor="#f8f8f8", edgecolor="#333", lw=1.2, zorder=0))
-
-    # Render board outline from DXF/Gerber
-    if has_outline:
-        render_board_entities(ax, board_layers["outline"], color="#444444",
-                           linewidth=0.6, alpha=0.9, mirror_x=mirror_x)
-
-    # Render solder mask + overlay as background
-    if has_dxf:
+        # No real outline in the Gerber/DXF - show the extents instead
+        ax.add_patch(Rectangle((x_min, y_min), x_max-x_min, y_max-y_min,
+                               facecolor="#f8f8f8", edgecolor="#333",
+                               lw=mm_lw(LW_NARROW), zorder=0))
+    else:
+        render_board_entities(ax, board_layers["outline"], color="#333333",
+                              linewidth=mm_lw(LW_NARROW), alpha=0.9,
+                              mirror_x=mirror_x, scale=scale)
+    if has_art:
         overlay_key = "bottom" if layer == "Bottom" else "top"
         if board_layers.get(overlay_key):
             render_board_entities(ax, board_layers[overlay_key], color="#888888",
-                               linewidth=0.3, alpha=0.5, mirror_x=mirror_x)
+                                  linewidth=mm_lw(LW_FINE), alpha=0.5,
+                                  mirror_x=mirror_x, scale=scale)
 
-    # Background components (gray) — skip if DXF provides the visuals.
-    # Always draw context on DNI pages, otherwise the page looks empty
+    # Background components (grey). Skipped when the artwork already shows
+    # them, except on DNI pages - those would otherwise look empty.
     is_dni_page = bool(gwc) and all(g.dni for g, _, _ in gwc)
     highlighted = set()
-    for g, _, _ in gwc: highlighted.update(g.designators)
-    if not has_dxf or is_dni_page:
+    for g, _, _ in gwc:
+        highlighted.update(g.designators)
+    if not has_art or is_dni_page:
         for desig, comp in pnp.items():
-            if comp.layer != layer or desig in highlighted: continue
-            gray = "#e0e0e0" if comp.prefix in ("TP","S") else "#cccccc"
-            a = 0.4 if comp.prefix in ("TP","S") else 0.6
-            lw = 0.1 if comp.prefix in ("TP","S") else 0.15
+            if comp.layer != layer or desig in highlighted:
+                continue
+            gray = "#e0e0e0" if comp.prefix in ("TP", "S") else "#cccccc"
+            a = 0.4 if comp.prefix in ("TP", "S") else 0.6
             draw_component(ax, comp, gray, alpha=a, mirror_x=mirror_x,
-                          linewidth=lw, zorder=1, edge_color="#999")
+                           linewidth=LW_FINE * 0.6, zorder=1,
+                           edge_color="#999", scale=scale, key_marker=False)
 
-    # Highlighted components - colour fills (DNI: grey with hatching)
     for group, color_hex, _num in gwc:
         for desig in group.designators:
-            if desig not in pnp: continue
-            comp = pnp[desig]
-            if comp.layer != layer:
-                continue    # a component from the other side is not drawn on this page
-            alpha_val = 0.65 if has_dxf else 0.92
-            draw_component(ax, comp, color_hex, alpha=alpha_val, label=True,
-                          mirror_x=mirror_x, linewidth=0.5, zorder=4,
-                          edge_color="#333",
-                          hatch="///" if group.dni else None)
+            comp = pnp.get(desig)
+            if comp is None or comp.layer != layer:
+                continue    # a part from the other side is not drawn on this page
+            draw_component(ax, comp, color_hex,
+                           alpha=0.65 if has_art else 0.92, label=True,
+                           mirror_x=mirror_x, zorder=4, edge_color="#333",
+                           linewidth=LW_NARROW if group.dni else LW_FINE,
+                           scale=scale, hatch="///" if group.dni else None)
 
-    ax.set_xticks([]); ax.set_yticks([])
-    for s in ax.spines.values(): s.set_visible(False)
-
-
-def draw_table(fig, gwc):
-    ax = fig.add_axes([0.04, 0.065, 0.92, 0.25])
-    ax.set_xlim(0,1); ax.set_ylim(0,1); ax.axis("off")
-    cx = [0.01, 0.06, 0.58, 0.78, 0.88]
-    headers = [STR["cell"], STR["refdes"], STR["description"],
-               STR["qty"], STR["note"]]
-    rh = 1.0 / (ROWS_PER_PAGE + 1.2); hy = 1.0 - rh * 0.2
-    for j, h in enumerate(headers):
-        ax.text(cx[j]+0.01, hy, h, ha="left", va="top",
-               fontsize=5, fontweight="bold", color="#444")
-    ax.axhline(y=hy-rh*0.55, xmin=0.01, xmax=0.99, color="#999", lw=0.5)
-    for i, (group, color, num) in enumerate(gwc):
-        ry = hy - rh * (i + 1.1)
-        ax.add_patch(Rectangle((cx[0], ry-rh*0.3), 0.04, rh*0.6,
-                               facecolor=color, edgecolor="#333", lw=0.5,
-                               hatch="///" if group.dni else None))
-        # Cell number inside the swatch - readable with colour blindness and in B/W
-        if num is not None:
-            ax.text(cx[0]+0.02, ry, str(num), ha="center", va="center",
-                    fontsize=4.5, fontweight="bold", color="white",
-                    path_effects=[pe.Stroke(linewidth=0.9, foreground="#333"),
-                                  pe.Normal()])
-        dt = ", ".join(group.designators)
-        if len(dt) > 60: dt = dt[:57] + "..."
-        sfx = " [DNI]" if group.dni else ""
-        ax.text(cx[1]+0.01, ry, dt+sfx, ha="left", va="center", fontsize=4, color="#222")
-        desc = group.description
-        if len(desc) > 38: desc = desc[:35] + "..."
-        ax.text(cx[2]+0.01, ry, desc, ha="left", va="center", fontsize=4.5, color="#333")
-        ax.text(cx[3]+0.04, ry, str(group.quantity), ha="center", va="center",
-               fontsize=5, color="#222")
-        note = STR["dni_short"] if group.dni else group.note
-        ax.text(cx[4]+0.01, ry, note, ha="left", va="center",
-               fontsize=3.5, color="#b00020" if group.dni else "#666")
-        ax.axhline(y=ry-rh*0.42, xmin=0.01, xmax=0.99, color="#ddd", lw=0.3)
-
-
-def draw_title_block(fig, project_name, layer, mt, page, total, edition, designer):
-    ax = fig.add_axes([0.04, 0.005, 0.92, 0.055])
-    ax.set_xlim(0,1); ax.set_ylim(0,1); ax.axis("off")
-    ax.add_patch(Rectangle((0,0), 1, 1, facecolor="#f5f5f5", edgecolor="#333", lw=0.8))
-    for dx in [0.28, 0.56, 0.76, 0.88]:
-        ax.plot([dx,dx], [0,1], color="#aaa", lw=0.4)
-    ax.text(0.14, 0.6, project_name, ha="center", va="center",
-           fontsize=7, fontweight="bold", color="#222")
-    ax.text(0.14, 0.2, designer, ha="center", va="center", fontsize=5, color="#777")
-    ax.text(0.42, 0.6, f"{layer} {mt}", ha="center", va="center",
-           fontsize=7, fontweight="bold", color="#222")
-    ax.text(0.42, 0.2, "Assembly Drawing", ha="center", va="center",
-           fontsize=5, color="#777")
-    ax.text(0.66, 0.5, f"Edition: {edition}", ha="center", va="center",
-           fontsize=6, color="#333")
-    ax.text(0.82, 0.5, f"Sheet {page}/{total}", ha="center", va="center",
-           fontsize=6, fontweight="bold", color="#333")
-    ax.text(0.94, 0.5, "A4", ha="center", va="center", fontsize=5, color="#999")
+    # View caption and scale designation (ISO 5455: the word SCALE + the ratio)
+    cx_, cy_ = sheet.lay["caption"]
+    view = STR["view_bottom"] if layer == "Bottom" else STR["view_top"]
+    scale_note = "%s %s" % (STR["tb_scale"].split(" / ")[0].upper(), scale_txt)
+    sheet.text(sheet.x1 - 1.0, cy_, scale_note, h=H_MID, ha="right",
+               fontweight="bold")
+    room = (sheet.x1 - 1.0) - sheet.measure(scale_note, H_MID, "bold") - cx_ - 4.0
+    sheet.ftext(cx_ + 1.0, cy_, view, room, h=H_MID, fontweight="bold")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1207,9 +1716,21 @@ def detect_mount_type(groups):
 
 
 def generate_pdf(pnp, groups_by_layer, output_path,
-                 project_name="Project", designed_by="", edition="v1.0",
-                 progress_callback=None, board_layers=None):
-    bounds = compute_bounds(pnp, board_layers)
+                 project_name="Project", designed_by="", edition="A",
+                 progress_callback=None, board_layers=None,
+                 sheet_format="A4", landscape=True, scale_mode="auto",
+                 meta=None):
+    bounds = compute_bounds(pnp, board_layers, margin=2.0)
+    lay = sheet_layout(sheet_format, landscape)
+    _bx, _by, area_w, area_h = lay["board"]
+    scale, scale_txt = resolve_scale(bounds[1] - bounds[0], bounds[3] - bounds[2],
+                                     area_w, area_h, scale_mode)
+    info = dict(meta or {})
+    info.setdefault("project", project_name)
+    info.setdefault("designer", designed_by)
+    info.setdefault("edition", edition)
+    info.setdefault("date", datetime.date.today().isoformat())
+
     plan = []
     for layer in ["Bottom", "Top"]:
         groups = groups_by_layer.get(layer)
@@ -1225,23 +1746,26 @@ def generate_pdf(pnp, groups_by_layer, output_path,
                    for j, g in enumerate(chunk)]
             plan.append((layer, mt, gwc))
         # DNI parts get their own pages at the end of each side, grey and hatched
+        base = len(install)
         for i in range(0, len(dni_groups), ROWS_PER_PAGE):
             chunk = dni_groups[i:i+ROWS_PER_PAGE]
-            gwc = [(g, DNI_COLOR, None) for g in chunk]
+            gwc = [(g, DNI_COLOR, base + i + j + 1) for j, g in enumerate(chunk)]
             plan.append((layer, STR["dni_page"], gwc))
     total = len(plan)
     if total == 0: return 0
 
     with PdfPages(output_path) as pdf:
         for pn, (layer, mt, gwc) in enumerate(plan, 1):
-            fig = plt.figure(figsize=(11.69, 8.27), facecolor="white")
-            fig.patches.append(Rectangle((0.02,0.002), 0.96, 0.996,
-                facecolor="none", edgecolor="#555", lw=0.8, transform=fig.transFigure))
-            draw_board(fig, pnp, gwc, layer, bounds, board_layers=board_layers)
-            draw_table(fig, gwc)
-            draw_title_block(fig, project_name, layer, mt, pn, total, edition, designed_by)
-            pdf.savefig(fig, dpi=150)
-            plt.close(fig)
+            sheet = Sheet(sheet_format, landscape)
+            draw_frame(sheet)
+            draw_board_view(sheet, pnp, gwc, layer, bounds, scale, scale_txt,
+                            board_layers=board_layers)
+            draw_parts_list(sheet, gwc, lay["rowh"])
+            view = STR["view_bottom"] if layer == "Bottom" else STR["view_top"]
+            draw_title_block(sheet, info, pn, total,
+                             "%s · %s" % (view, mt), scale_txt)
+            pdf.savefig(sheet.fig)
+            plt.close(sheet.fig)
             if progress_callback:
                 progress_callback(pn, total, layer, mt,
                                   sum(g.quantity for g, _, _ in gwc))
@@ -1509,6 +2033,8 @@ class App:
     # Metrics
     BTN_H = 32            # every toolbar button is this tall
     SIDE_BTN_W = 92       # BOTTOM and TOP share a width
+    FIELD_W = 264         # export dialog: value column, fixed so it cannot grow
+    HINT_W = 400          # export dialog: hint wrap width, keeps it two lines
     CARD_W = 188
 
     def __init__(self, root):
@@ -1522,7 +2048,11 @@ class App:
         self.custom_order = []  # user-defined prefix order
         self.main_built = False
         self.loaded = {"pnp": False, "bom": False, "gerber": False}
-        self.meta = {"project": "Assembly", "designer": "", "edition": "v1.0"}
+        self.meta = {"project": "Assembly", "designer": "", "edition": "A",
+                     "owner": "", "doc_no": "", "approver": "",
+                     "sheet_format": "A4", "orientation": "Landscape",
+                     "scale_mode": "auto",
+                     "date": datetime.date.today().isoformat()}
         self._show_welcome()
 
     # ══════════════════════════════════════════════════════════════════
@@ -2182,34 +2712,123 @@ class App:
     # ── Export ────────────────────────────────────────────────────────
 
     def _ask_metadata(self):
-        """Title block dialog: project / designer / edition. None = cancelled."""
+        """Drawing setup: sheet, scale and the ISO 7200 title block fields.
+
+        Returns the metadata dict, or None when the dialog was cancelled.
+        """
         dlg = tk.Toplevel(self.root)
-        dlg.title("Title block")
-        dlg.configure(bg="#111827")
+        dlg.title("Drawing setup — ISO 5457 / ISO 7200")
+        dlg.configure(bg=self.C_PANEL)
         dlg.transient(self.root); dlg.grab_set()
-        fields = [("Project", self.meta.get("project", "Assembly")),
-                  ("Designer", self.meta.get("designer", "")),
-                  ("Edition", self.meta.get("edition", "v1.0"))]
-        entries = []
-        for i, (lbl, default) in enumerate(fields):
-            tk.Label(dlg, text=lbl, bg="#111827", fg="#8b96ab",
-                     font=("Segoe UI", 9)).grid(row=i, column=0, sticky="w",
-                                               padx=12, pady=6)
-            e = tk.Entry(dlg, width=30, bg="#1a2236", fg="#f8fafc",
-                         insertbackground="white", relief="flat")
-            e.insert(0, default)
-            e.grid(row=i, column=1, padx=12, pady=6)
-            entries.append(e)
+        dlg.resizable(False, False)
+        dlg.columnconfigure(1, minsize=self.FIELD_W)
+
+        def head(text, row):
+            tk.Label(dlg, text=text, bg=self.C_PANEL, fg=self.C_FAINT,
+                     font=("Segoe UI", 8, "bold")).grid(
+                row=row, column=0, columnspan=2, sticky="w",
+                padx=14, pady=(14, 2))
+
+        def entry(label, key, default, row, width=34):
+            tk.Label(dlg, text=label, bg=self.C_PANEL, fg=self.C_MUTED,
+                     font=self.F_SMALL).grid(row=row, column=0, sticky="w",
+                                             padx=(14, 8), pady=4)
+            e = tk.Entry(dlg, width=width, bg=self.C_CARD, fg=self.C_TEXT,
+                         insertbackground="white", relief="flat",
+                         font=self.F_SMALL)
+            e.insert(0, self.meta.get(key, default))
+            e.grid(row=row, column=1, sticky="w", padx=(0, 14), pady=4,
+                   ipady=3)
+            return e
+
+        def combo(label, key, values, default, row):
+            tk.Label(dlg, text=label, bg=self.C_PANEL, fg=self.C_MUTED,
+                     font=self.F_SMALL).grid(row=row, column=0, sticky="w",
+                                             padx=(14, 8), pady=4)
+            var = tk.StringVar(value=self.meta.get(key, default))
+            box = ttk.Combobox(dlg, textvariable=var, values=values,
+                               state="readonly", width=31, font=self.F_SMALL)
+            box.grid(row=row, column=1, sticky="w", padx=(0, 14), pady=4)
+            return var
+
+        head("SHEET — ISO 5457", 0)
+        v_fmt = combo("Format", "sheet_format",
+                      list(SHEET_SIZES.keys()), "A4", 1)
+        v_orient = combo("Orientation", "orientation",
+                         ["Landscape", "Portrait"], "Landscape", 2)
+        v_scale = combo("Scale", "scale_mode",
+                        ["auto", "fit"] + ["%d:%d" % s for s in ISO_SCALES],
+                        "auto", 3)
+
+        head("TITLE BLOCK — ISO 7200", 4)
+        e_title = entry("Title", "project", "Assembly", 5)
+        e_owner = entry("Legal owner", "owner", "", 6)
+        e_docno = entry("Identification no.", "doc_no", "", 7)
+        e_rev = entry("Revision index", "edition", "A", 8)
+        e_date = entry("Date of issue", "date",
+                       datetime.date.today().isoformat(), 9)
+        e_creator = entry("Created by", "designer", "", 10)
+        e_appr = entry("Approved by", "approver", "", 11)
+
+        # Fixed width and two reserved lines: the hint text changes length with
+        # every selection, and without this the window would resize under the
+        # pointer as the user picks values.
+        hint = tk.Label(dlg, bg=self.C_PANEL, fg=self.C_FAINT,
+                        font=("Segoe UI", 8), justify="left", anchor="nw",
+                        wraplength=self.HINT_W, width=1, height=2)
+        hint.grid(row=12, column=0, columnspan=2, sticky="we", padx=14,
+                  pady=(12, 0))
+
+        def refresh_hint(*_):
+            fmt = v_fmt.get()
+            land = v_orient.get() == "Landscape"
+            lay = sheet_layout(fmt, land)
+            bounds = compute_bounds(self.pnp, self.board_layers, margin=2.0)
+            _x, _y, aw, ah = lay["board"]
+            _f, txt = resolve_scale(bounds[1] - bounds[0], bounds[3] - bounds[2],
+                                    aw, ah, v_scale.get())
+            note = ""
+            if fmt == "A4" and land:
+                note = "\nISO 5457 places A4 upright; landscape is a deviation."
+            hint.configure(text="Sheet %.0f × %.0f mm · view %.0f × %.0f mm · "
+                                "scale %s%s" % (lay["w"], lay["h"], aw, ah,
+                                                txt, note))
+
+        for var in (v_fmt, v_orient, v_scale):
+            var.trace_add("write", refresh_hint)
+        refresh_hint()
+
         out = {}
+
         def ok():
-            out["project"], out["designer"], out["edition"] = \
-                [e.get().strip() for e in entries]
+            out.update({
+                "sheet_format": v_fmt.get(),
+                "orientation": v_orient.get(),
+                "scale_mode": v_scale.get(),
+                "project": e_title.get().strip() or "Assembly",
+                "owner": e_owner.get().strip(),
+                "doc_no": e_docno.get().strip(),
+                "edition": e_rev.get().strip() or "A",
+                "date": e_date.get().strip(),
+                "designer": e_creator.get().strip(),
+                "approver": e_appr.get().strip(),
+            })
             dlg.destroy()
-        tk.Button(dlg, text="Export", command=ok, bg="#10b981", fg="white",
-                  relief="flat", padx=18, font=("Segoe UI", 10, "bold")
-                  ).grid(row=3, column=1, sticky="e", padx=12, pady=10)
-        entries[0].focus_set()
+
+        bar = tk.Frame(dlg, bg=self.C_PANEL)
+        bar.grid(row=13, column=0, columnspan=2, sticky="e", padx=14,
+                 pady=(8, 14))
+        tk.Button(bar, text="Cancel", command=dlg.destroy, bg=self.C_CARD,
+                  fg=self.C_MUTED, relief="flat", padx=14,
+                  font=self.F_SMALL).pack(side="left", padx=(0, 8))
+        tk.Button(bar, text="Export", command=ok, bg=self.C_GREEN, fg="white",
+                  relief="flat", padx=18, font=self.F_BTN).pack(side="left")
+        e_title.focus_set()
         dlg.bind("<Return>", lambda e: ok())
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        dlg.update_idletasks()
+        dlg.geometry("%dx%d" % (dlg.winfo_reqwidth(), dlg.winfo_reqheight()))
+        dlg.grid_propagate(False)
         dlg.wait_window()
         if not out:
             return None
@@ -2236,10 +2855,11 @@ class App:
                 text=f"PDF: page {pn}/{total}..."))
         try:
             pages = generate_pdf(self.pnp, self.groups, path,
-                project_name=meta["project"] or "Assembly",
-                designed_by=meta["designer"],
-                edition=meta["edition"] or "v1.0",
+                sheet_format=meta.get("sheet_format", "A4"),
+                landscape=meta.get("orientation", "Landscape") == "Landscape",
+                scale_mode=meta.get("scale_mode", "auto"),
                 board_layers=self.board_layers,
+                meta=meta,
                 progress_callback=progress)
             self.root.after(0, self._export_done, path, pages, None)
         except Exception as e:
