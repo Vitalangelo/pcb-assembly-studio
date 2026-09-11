@@ -15,7 +15,7 @@ found by looking instead of reading designators.*
 
 ## 📥 Download
 
-**[PCBAssemblyStudio.exe](https://github.com/VitaliyaF/pcb-assembly-studio/releases/latest)** — one file, ~44 MB, double-click. No Python needed.
+**[PCBAssemblyStudio.exe](https://github.com/Vitalangelo/pcb-assembly-studio/releases/latest)** — one file, ~44 MB, double-click. No Python needed.
 
 > Not code-signed, so Windows shows a warning on first run: **More info** → **Run anyway**.
 

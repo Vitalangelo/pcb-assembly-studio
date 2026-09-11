@@ -66,7 +66,7 @@ if errorlevel 1 (
     echo ============================================
     echo.
     echo Copy the message above when reporting a bug:
-    echo   https://github.com/VitaliyaF/pcb-assembly-studio/issues
+    echo   https://github.com/Vitalangelo/pcb-assembly-studio/issues
     echo.
     pause
 )
