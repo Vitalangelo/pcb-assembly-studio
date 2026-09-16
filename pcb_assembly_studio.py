@@ -6,6 +6,7 @@ Assembly drawing generator for Altium Designer / KiCad projects.
 Standalone GUI - packaged to .exe via PyInstaller.
 """
 
+import copy
 import csv
 import datetime
 import io
@@ -55,7 +56,7 @@ PREFIX_ORDER = {
     "F": 30, "J": 31, "X": 32, "P": 33, "S": 40, "SW": 40,
 }
 
-APP_VERSION = "1.1"
+APP_VERSION = "1.1.1"
 
 # ---------------------------------------------------------------------------
 #  ISO drawing sheet - geometry, line widths, lettering
@@ -97,6 +98,13 @@ PT_PER_MM = 72.0 / 25.4     # matplotlib measures in points, the sheet in millim
 CAP_RATIO = 0.70            # cap height / em size of the default sans font
 
 
+def shade(hex_color, factor=0.45):
+    """Darken a #rrggbb colour, keeping its hue."""
+    h = hex_color.lstrip("#")
+    r, g, b = (int(h[i:i+2], 16) for i in (0, 2, 4))
+    return "#%02x%02x%02x" % (int(r*factor), int(g*factor), int(b*factor))
+
+
 def mm_font(h_mm):
     """ISO 3098 lettering height (cap height, mm) -> matplotlib font size in pt."""
     return h_mm * PT_PER_MM / CAP_RATIO
@@ -128,7 +136,6 @@ _STRINGS = {
         "item": "Item",
         "part_no": "Part number",
         "tech_data": "Technical data",
-        "package": "Package",
         "remarks": "Remarks",
         "tb_owner": "Legal owner",
         "tb_doctype": "Document type",
@@ -157,7 +164,6 @@ _STRINGS = {
         "item": "Поз. / Item",
         "part_no": "Тип / Part number",
         "tech_data": "Техн. данные / Technical data",
-        "package": "Корпус / Package",
         "remarks": "Примечание / Remarks",
         "tb_owner": "Владелец / Legal owner",
         "tb_doctype": "Тип документа / Document type",
@@ -333,7 +339,6 @@ class ComponentGroup:
     quantity: int
     note: str = ""
     dni: bool = False
-    footprint: str = ""
     part_no: str = ""
     tech: str = ""
 
@@ -364,6 +369,19 @@ _PNP_CELL_MATCH = {
     "description": lambda n: n.startswith("desc"),
     "footprint":  lambda n: n in ("footprint", "package", "pattern"),
 }
+
+
+def project_name(filepath):
+    """Board name from a Pick & Place file name, for the drawing title.
+
+    Altium names the file "Pick Place for <board>", KiCad "<board>-top.pos" or
+    "<board>-all-pos.csv"; only <board> belongs in a title block.
+    """
+    stem = os.path.splitext(os.path.basename(filepath))[0]
+    name = re.sub(r"^pick[\s_-]*(?:(?:and|&)[\s_-]*)?place(?:[\s_-]+for)?[\s_-]+",
+                  "", stem, flags=re.I)
+    name = re.sub(r"-(?:top|bottom|both|all)(?:-pos)?$", "", name, flags=re.I)
+    return name.strip() or stem
 
 
 def parse_pick_place(filepath):
@@ -940,33 +958,6 @@ def _bom_cols(header):
     }
 
 
-# Trailing footprint tokens that describe how the pads are drawn rather than
-# what the part is: pitch, pad/mask/exposed-pad geometry, mounting variants,
-# and the metric code that merely repeats the imperial one (0402 = 1005Metric).
-_FP_NOISE = re.compile(
-    r"^(?:\d{3,4}metric"
-    r"|p[\d.]+mm"
-    r"|(?:pad|mask|ep)[\d.x]*mm"
-    r"|handsolder|thermalvias|horizontal|vertical|nominal|castellated"
-    r"|pin1\w*)$", re.I)
-
-
-def short_package(fp):
-    """Trim a footprint name down to the part an assembler needs to read.
-
-    Library names carry the whole pad geometry - "SOIC-8-1EP_3.9x4.9mm_P1.27mm_
-    EP2.95x4.9mm_Mask2.71x3.4mm_ThermalVias" - which is unreadable in a table
-    cell. Trailing tokens that only describe the pads are dropped, which leaves
-    the package and its body size. Names whose meaning sits in a later token,
-    such as "Crystal_SMD_HC49-SD", survive intact.
-    """
-    fp = str(fp or "").strip().strip('"')
-    parts = fp.split("_")
-    while len(parts) > 1 and _FP_NOISE.match(parts[-1]):
-        parts.pop()
-    return "_".join(parts)
-
-
 # Values that occupy a Part Number cell without naming a part. Altium writes
 # "[NoParam], OPA2180IDGK" when a variant leaves the parameter unset.
 _PN_PLACEHOLDER = re.compile(r"^(?:generic|\[?noparam\]?|n/?a|none|-+|\*)$", re.I)
@@ -1100,7 +1091,6 @@ def group_from_bom(bom_rows, pnp):
                 comment=row["comment"], description=row["full_desc"],
                 designators=ds, quantity=len(ds),
                 note=STR["key"] if is_keyed else "", dni=row["dni"],
-                footprint=short_package(row["footprint"]),
                 part_no=row["part_no"], tech=row["tech"]))
     # Don't sort here - let the UI sort mode decide the order
     return dict(by_layer)
@@ -1118,13 +1108,10 @@ def group_auto(pnp):
         for prefix in sorted(by_lp[layer], key=lambda p: PREFIX_ORDER.get(p, 50)):
             desigs = sorted(by_lp[layer][prefix], key=natural_sort_key)
             is_keyed = prefix in KEYED_PREFIXES
-            fps = {short_package(pnp[d].footprint) for d in desigs}
-            fps.discard("")
             groups.append(ComponentGroup(
                 comment=f"{prefix}", description=f"All {prefix} components",
                 designators=desigs, quantity=len(desigs),
                 note=STR["key"] if is_keyed else "",
-                footprint=fps.pop() if len(fps) == 1 else "",
                 part_no=prefix))
         result[layer] = groups
     return result
@@ -1223,7 +1210,10 @@ def draw_component(ax, comp, color, alpha=1.0, label=False,
     if mirrored:
         x = mirror_x - x
     w, h = comp.w, comp.h
-    lw = mm_lw(linewidth)
+    # A fixed ISO line width swamps a small part: a 0.25 mm edge around a 0402
+    # drawn 0.4 mm tall leaves hardly any colour showing, and every group
+    # prints as the same dark grey. The edge stays a fraction of the short side.
+    lw = mm_lw(min(linewidth, max(0.05, min(w, h) * scale * 0.15)))
     if comp.shape == "circle":
         ax.add_patch(Circle((x, y), w/2, facecolor=color, edgecolor=edge_color,
                            linewidth=lw, alpha=alpha, zorder=zorder,
@@ -1560,8 +1550,9 @@ def draw_title_block(sheet, meta, page, total, sub_title, scale_txt):
 def draw_parts_list(sheet, gwc, rowh):
     """ISO 7573:2008 parts list.
 
-    Columns follow 5.2.1: part reference, quantity, reference designation,
-    part number, technical data, package and remarks.
+    Columns: part reference, reference designation, part number, technical
+    data, quantity and remarks - the 5.2.1 set without a package column, and
+    with the quantity moved from after the part reference to before remarks.
 
     Deviation from 5.1: the header sits at the top and the items read downward.
     The standard puts the header against the title block - which would mean
@@ -1572,7 +1563,7 @@ def draw_parts_list(sheet, gwc, rowh):
     s = sheet
     x, y = s.lay["parts_list"]
     W = TITLE_BLOCK_W
-    cols = [0.0, 12.0, 21.0, 67.0, 99.0, 135.0, 168.0, W]   # column boundaries
+    cols = [0.0, 12.0, 70.0, 108.0, 154.0, 166.0, W]   # column boundaries
     # The grid is always full height. Pages with fewer groups leave blank rows,
     # the way a preprinted list does, so every sheet has the same geometry.
     total_h = rowh * (ROWS_PER_PAGE + 1)
@@ -1584,8 +1575,8 @@ def draw_parts_list(sheet, gwc, rowh):
     for i in range(1, ROWS_PER_PAGE):
         s.line(x, y + rowh * i, x + W, y + rowh * i)
 
-    heads = [STR["item"], STR["qty"], STR["refdes"], STR["part_no"],
-             STR["tech_data"], STR["package"], STR["remarks"]]
+    heads = [STR["item"], STR["refdes"], STR["part_no"], STR["tech_data"],
+             STR["qty"], STR["remarks"]]
     for j, head in enumerate(heads):
         s.ftext(x + cols[j] + 1.4, head_y + rowh / 2.0, head,
                 cols[j + 1] - cols[j] - 2.8, h=H_MICRO, fontweight="bold")
@@ -1604,23 +1595,21 @@ def draw_parts_list(sheet, gwc, rowh):
                                   edgecolor="#000", lw=mm_lw(LW_FINE), zorder=4))
             s.text(x + cols[1] / 2.0, mid, str(num), h=H_MICRO, ha="center",
                    fontweight="bold", zorder=5)
-        s.text(x + (cols[1] + cols[2]) / 2.0, mid, str(group.quantity),
-               h=H_SMALL, ha="center")
-        w_ref = cols[3] - cols[2] - 2.8
+        w_ref = cols[2] - cols[1] - 2.8
         refs = _wrap_mm(", ".join(group.designators), w_ref, H_MICRO,
                         max_lines=2 if rowh >= 6.0 else 1, sep=", ")
         lead = (len(refs) - 1) / 2.0 * H_MICRO * 1.5
         for k, ln in enumerate(refs):
-            s.ftext(x + cols[2] + 1.4, mid + lead - k * H_MICRO * 1.5, ln,
+            s.ftext(x + cols[1] + 1.4, mid + lead - k * H_MICRO * 1.5, ln,
                     w_ref, h=H_MICRO)
-        s.ftext(x + cols[3] + 1.4, mid, group.part_no or group.comment,
+        s.ftext(x + cols[2] + 1.4, mid, group.part_no or group.comment,
+                cols[3] - cols[2] - 2.8, h=H_SMALL)
+        s.ftext(x + cols[3] + 1.4, mid, group.tech,
                 cols[4] - cols[3] - 2.8, h=H_SMALL)
-        s.ftext(x + cols[4] + 1.4, mid, group.tech,
-                cols[5] - cols[4] - 2.8, h=H_SMALL)
-        s.ftext(x + cols[5] + 1.4, mid, group.footprint,
-                cols[6] - cols[5] - 2.8, h=H_SMALL)
+        s.text(x + (cols[4] + cols[5]) / 2.0, mid, str(group.quantity),
+               h=H_SMALL, ha="center")
         note = STR["dni_short"] if group.dni else group.note
-        s.ftext(x + cols[6] + 1.4, mid, note, W - cols[6] - 2.8, h=H_MICRO,
+        s.ftext(x + cols[5] + 1.4, mid, note, W - cols[5] - 2.8, h=H_MICRO,
                 color="#b00020" if group.dni else "#333")
 
 
@@ -1680,13 +1669,16 @@ def draw_board_view(sheet, pnp, gwc, layer, bounds, scale, scale_txt,
                            edge_color="#999", scale=scale, key_marker=False)
 
     for group, color_hex, _num in gwc:
+        # Solid fill, edged in a darker shade of the same colour: artwork
+        # showing through a translucent part muddies neighbouring colours
+        # into each other, and a grey edge on a tiny part reads as grey.
+        edge = "#333" if group.dni else shade(color_hex, 0.55)
         for desig in group.designators:
             comp = pnp.get(desig)
             if comp is None or comp.layer != layer:
                 continue    # a part from the other side is not drawn on this page
-            draw_component(ax, comp, color_hex,
-                           alpha=0.65 if has_art else 0.92, label=True,
-                           mirror_x=mirror_x, zorder=4, edge_color="#333",
+            draw_component(ax, comp, color_hex, label=True,
+                           mirror_x=mirror_x, zorder=4, edge_color=edge,
                            linewidth=LW_NARROW if group.dni else LW_FINE,
                            scale=scale, hatch="///" if group.dni else None)
 
@@ -1787,6 +1779,14 @@ class BoardCanvas:
     """Interactive PCB board viewer with zoom/pan on light board."""
     BOARD_BG = "#ffffff"
     COMP_IDLE = "#d0d0d0"
+    ZOOM_STEP = 1.15
+    # Focus mode: everything but the chosen group fades almost to the board
+    # colour, so the group stands out without hiding where on the board it is.
+    FADE_OUTLINE = "#dddddd"
+    FADE_ART = "#efefef"
+    FADE_COMP = "#f3f3f3"
+    RING_BELOW = 16     # px - parts smaller than this on screen get a locator ring
+    CLICK_SLOP = 4      # px - a press that moves further than this is a pan
 
     def __init__(self, parent):
         self.canvas = tk.Canvas(parent, bg="#0a0e1a", highlightthickness=0)
@@ -1797,16 +1797,22 @@ class BoardCanvas:
         self.colors = {}
         self.active = set()
         self.hl = set()
+        self.focus = set()
+        self.on_click = None        # called for a click on the board, not a pan
         self.bounds = (0, 100, 0, 80)
         self.side = "Bottom"
         self.board_layers = None
         self._px = self._py = 0
+        self._press_at = None
         self._last_size = (0, 0)
-        self.canvas.bind("<MouseWheel>", lambda e: self._do_zoom(e, 1.15 if e.delta < 0 else 0.87))
-        self.canvas.bind("<Button-4>", lambda e: self._do_zoom(e, 0.87))
-        self.canvas.bind("<Button-5>", lambda e: self._do_zoom(e, 1.15))
-        self.canvas.bind("<ButtonPress-1>", lambda e: setattr(self, '_px', e.x) or setattr(self, '_py', e.y))
+        # Wheel away from you zooms in
+        self.canvas.bind("<MouseWheel>", lambda e: self._do_zoom(
+            e, self.ZOOM_STEP if e.delta > 0 else 1 / self.ZOOM_STEP))
+        self.canvas.bind("<Button-4>", lambda e: self._do_zoom(e, self.ZOOM_STEP))
+        self.canvas.bind("<Button-5>", lambda e: self._do_zoom(e, 1 / self.ZOOM_STEP))
+        self.canvas.bind("<ButtonPress-1>", self._press)
         self.canvas.bind("<B1-Motion>", self._pan)
+        self.canvas.bind("<ButtonRelease-1>", self._release)
         self.canvas.bind("<Configure>", self._on_resize)
 
     def load(self, comps, side, colors, active, bounds, board_layers=None):
@@ -1816,7 +1822,7 @@ class BoardCanvas:
                             c.rotation, c.shape)
                            for c in comps if c.layer == side]
         self.side = side; self.colors = colors; self.active = active
-        self.bounds = bounds; self.hl = set()
+        self.bounds = bounds; self.hl = set(); self.focus = set()
         self.board_layers = board_layers
         self.canvas.after(100, self.fit)
 
@@ -1826,7 +1832,15 @@ class BoardCanvas:
             self.hl = new           # widgets of the same legend row
             self.draw()
 
+    def set_focus(self, desigs):
+        """Fade the board around these parts until cleared with None.
+        Unlike load() this keeps the zoom, so a zoomed-in area stays put."""
+        self.focus = set(desigs) if desigs else set()
+        self.draw()
+
     def fit(self):
+        if not self.canvas.winfo_exists():
+            return      # the workspace was closed before the timer fired
         x1, x2, y1, y2 = self.bounds
         cw = max(self.canvas.winfo_width(), 100)
         ch = max(self.canvas.winfo_height(), 100)
@@ -1869,6 +1883,9 @@ class BoardCanvas:
         c = self.canvas; c.delete("all")
         b = self.bounds
         has_gerber = bool(self.board_layers)
+        # Hovering a legend row previews that group; otherwise the clicked one
+        shown = self.hl or self.focus
+        faded = bool(self.focus)
 
         # Always draw white board background
         bx1, by1 = self._tx(b[0]+1), self._ty(b[3]-1)
@@ -1878,49 +1895,57 @@ class BoardCanvas:
 
         # 1) Board outline from Gerber
         if has_gerber and self.board_layers.get("outline"):
-            self._draw_entities(self.board_layers["outline"], "#888877", 1.0)
+            self._draw_entities(self.board_layers["outline"],
+                                self.FADE_OUTLINE if faded else "#888877", 1.0)
 
         # 2) Gerber overlay (dark on white board) — UNDER colored blocks
         if has_gerber:
             key = "bottom" if self.side == "Bottom" else "top"
             if self.board_layers.get(key):
-                self._draw_entities(self.board_layers[key], "#444444", 0.7)
+                self._draw_entities(self.board_layers[key],
+                                    self.FADE_ART if faded else "#444444", 0.7)
 
-        # 3) Colored blocks WITH stipple on top (semi-transparent over gerber)
-        has_hl = len(self.hl) > 0
+        # 3) Colored blocks, solid: a stippled block over the artwork turned
+        #    neighbouring colours into the same speckled grey
+        rings = []
         for d, cx, cy, w, h, pfx, rot, shape in self.components:
             X, Y, pts = self._corners(cx, cy, w, h, rot)
             sw, sh = w*self.zoom, h*self.zoom
             is_act = d in self.active
-            is_hl = d in self.hl
+            is_hl = d in shown
             col = self.colors.get(d, self.COMP_IDLE)
-            if has_hl:
-                fill = col if is_hl else "#e8e8e8"
-                ol = "#555" if is_hl else "#ccc"
+            if shown:
+                fill = col if is_hl else (self.FADE_COMP if faded else "#e8e8e8")
+                ol = shade(col, 0.6) if is_hl else ("" if faded else "#ccc")
                 lw = 1.0 if is_hl else 0.2
+                if is_hl and faded and max(sw, sh) < self.RING_BELOW:
+                    rings.append((X, Y, max(sw, sh) / 2 + 7, col))
             else:
                 fill = col if is_act else self.COMP_IDLE
-                ol = "#555" if is_act else "#ccc"
+                ol = shade(col, 0.6) if is_act else "#ccc"
                 lw = 0.8 if is_act else 0.3
-            stip = "gray50" if (is_act or is_hl) and has_gerber else ""
             if shape == "circle":
                 r = w/2*self.zoom
                 c.create_oval(X-r, Y-r, X+r, Y+r, fill=fill, outline=ol,
-                             width=lw, stipple=stip)
+                             width=lw)
             elif rot % 360 == 0:
                 c.create_rectangle(X-sw/2, Y-sh/2, X+sw/2, Y+sh/2,
-                                   fill=fill, outline=ol, width=lw, stipple=stip)
+                                   fill=fill, outline=ol, width=lw)
             else:
                 c.create_polygon(pts, fill=fill, outline=ol,
-                                width=max(lw, 0.5), stipple=stip)
+                                width=max(lw, 0.5))
 
-        # 4) Labels (topmost)
+        # 4) Locator rings, so a focused 0402 can be found without zooming.
+        #    The dark rim keeps a yellow ring visible on the white board.
+        for X, Y, r, col in rings:
+            c.create_oval(X-r, Y-r, X+r, Y+r, outline="#1f2937", width=4)
+            c.create_oval(X-r, Y-r, X+r, Y+r, outline=col, width=2)
+
+        # 5) Labels (topmost)
         for d, cx, cy, w, h, pfx, rot, shape in self.components:
             X, Y, pts = self._corners(cx, cy, w, h, rot)
             sw, sh = w*self.zoom, h*self.zoom
-            is_act = d in self.active
-            is_hl = d in self.hl
-            if not (is_act or is_hl): continue
+            if d not in shown and (faded or d not in self.active): continue
             if (pfx in ("U","J","X","XO","T","VT","F","S","SW") or max(w,h)>=4) and sw > 14:
                 fs = max(7, min(11, int(min(sw,sh)*0.32)))
                 c.create_text(X, Y, text=d, fill="white",
@@ -2006,9 +2031,20 @@ class BoardCanvas:
         self.off_y = e.y - (e.y - self.off_y)*f
         self.zoom *= f; self.draw()
 
+    def _press(self, e):
+        self._px, self._py = e.x, e.y
+        self._press_at = (e.x, e.y)
+
     def _pan(self, e):
         self.off_x += e.x - self._px; self.off_y += e.y - self._py
         self._px, self._py = e.x, e.y; self.draw()
+
+    def _release(self, e):
+        if self._press_at and self.on_click:
+            x0, y0 = self._press_at
+            if abs(e.x - x0) <= self.CLICK_SLOP and abs(e.y - y0) <= self.CLICK_SLOP:
+                self.on_click()
+        self._press_at = None
 
 
 class App:
@@ -2043,11 +2079,18 @@ class App:
         self.root.geometry("1200x750")
         self.root.configure(bg="#0a0e1a")
         self.pnp = {}; self.bom_data = []; self.groups = {"Top":[],"Bottom":[]}
+        # Pick & Place as parsed. BOM grouping writes into the components, so
+        # every regroup starts from a copy of this - a replaced BOM leaves no trace.
+        self.pnp_parsed = {}
         self.side = "Bottom"; self.page = 0; self.board_layers = None
         self.sort_mode = "standard"  # standard | bom | custom
         self.custom_order = []  # user-defined prefix order
         self.main_built = False
-        self.loaded = {"pnp": False, "bom": False, "gerber": False}
+        self.exporting = False
+        self.files = {"pnp": "", "bom": "", "gerber": ""}   # loaded file paths
+        self.auto_project = ""  # title taken from the P&P name, not typed in
+        self.focus_group = None  # legend index of the clicked group on this side
+        self.legend_rows = {}    # legend index -> row frame on the current page
         self.meta = {"project": "Assembly", "designer": "", "edition": "A",
                      "owner": "", "doc_no": "", "approver": "",
                      "sheet_format": "A4", "orientation": "Landscape",
@@ -2108,13 +2151,20 @@ class App:
             inner = tk.Frame(zone, bg="#111827")
             inner.pack(fill="x", padx=16)
 
-            lbl = tk.Label(inner, text=f"📁  Drop {title} here or click to browse",
-                font=("Segoe UI", 10), fg="#8b96ab", bg="#111827", anchor="w")
+            lbl = tk.Label(inner, font=("Segoe UI", 10), bg="#111827", anchor="w")
             lbl.pack(side="left")
+            # Unload button. Its own click binding does not reach the zone
+            # behind it, so removing a file never opens the browse dialog.
+            clear = tk.Label(inner, text="", width=2, font=("Segoe UI", 11),
+                             fg="#8b96ab", bg="#111827", cursor="hand2")
+            clear.pack(side="right", padx=(10, 0))
+            clear.bind("<Button-1>", lambda e, k=key: self._unload_file(k))
+            clear.bind("<Enter>", lambda e, c=clear: c.configure(fg="#f87171"))
+            clear.bind("<Leave>", lambda e, c=clear: c.configure(fg="#8b96ab"))
             tk.Label(inner, text=exts, font=("Segoe UI", 8), fg="#4b5568",
                     bg="#111827").pack(side="right")
 
-            self.drop_zones[key] = (zone, lbl)
+            self.drop_zones[key] = (title, lbl, clear)
 
             # Click to browse
             def make_browse(k, ft):
@@ -2143,72 +2193,81 @@ class App:
             zone.bind("<Enter>", lambda e, z=zone: z.configure(highlightbackground="#3b82f6"))
             zone.bind("<Leave>", lambda e, z=zone: z.configure(highlightbackground="#334155"))
 
-        # Start button (appears after PnP loaded)
-        self.start_btn_enabled = False
-        self._start_btn_parent = right
+        # Open button - greyed out until a Pick & Place is loaded
         self.start_btn = self._rounded_btn(right, "▶  Open project",
             self._try_open_project,
-            bg="#2a3350", fg="#5b6478", hover="#2a3350",
+            bg="#4f7cff", fg="white", hover="#3b63d9",
             font=("Segoe UI", 12, "bold"), padx=24, pady=10, radius=10)
         self.start_btn.pack(pady=(16, 0))
 
         tk.Label(right, text="100% offline · all files stay on your computer",
                 font=("Segoe UI", 8), fg="#334155", bg="#0a0e1a").pack(
                     side="bottom", pady=4)
+        # Coming back from the workspace, the files loaded so far are shown
+        self._update_welcome()
+
+    def _update_welcome(self):
+        """Dots, zone labels, unload buttons and the Open button, from self.files."""
+        if self.main_built:
+            return      # files imported from the workspace - no welcome screen
+        for k, path in self.files.items():
+            self.file_dots[k].configure(fg="#22c55e" if path else "#f59e0b")
+            title, lbl, clear = self.drop_zones[k]
+            if path:
+                lbl.configure(text=f"✅  {os.path.basename(path)}", fg="#22c55e")
+            else:
+                lbl.configure(text=f"📁  Drop {title} here or click to browse",
+                              fg="#8b96ab")
+            clear.configure(text="✕" if path else "")
+        self._set_btn_enabled(self.start_btn, bool(self.files["pnp"]))
 
     def _load_file_typed(self, ftype, path):
         try:
             if ftype == "pnp":
-                self.pnp = parse_pick_place(path)
-                self.loaded["pnp"] = True
-                if self.meta.get("project") in ("", "Assembly"):
-                    self.meta["project"] = os.path.splitext(os.path.basename(path))[0]
+                self.pnp_parsed = parse_pick_place(path)
+                # Replace a title that came from the previous P&P file name,
+                # but never one the user typed in
+                name = project_name(path)
+                if self.meta.get("project") in ("", "Assembly", self.auto_project):
+                    self.meta["project"] = name
+                self.auto_project = name
                 self._regroup()
             elif ftype == "bom":
-                self.bom_data = parse_bom(path)
-                if not self.bom_data:
+                bom = parse_bom(path)
+                if not bom:
                     raise ValueError(
                         "The BOM was read but contains no component rows.\n"
                         "Check the Designator / Comment columns.")
-                self.loaded["bom"] = True
-                if self.pnp:
-                    self._regroup()
+                self.bom_data = bom
+                self._regroup()
             elif ftype == "gerber":
                 self.board_layers = load_board_drawing(path)
-                self.loaded["gerber"] = True
         except Exception as e:
             messagebox.showerror("Error", str(e))
             return
+        self.files[ftype] = path
+        self._update_welcome()
 
-        # Update dots
-        for k, dot in self.file_dots.items():
-            dot.configure(fg="#22c55e" if self.loaded[k] else "#f59e0b")
-
-        # Update zone label
-        if ftype in self.drop_zones:
-            zone, lbl = self.drop_zones[ftype]
-            fname = os.path.basename(path)
-            lbl.configure(text=f"✅  {fname}", fg="#22c55e")
-
-        # Enable start button
-        if self.loaded["pnp"]:
-            if not self.start_btn_enabled:
-                self.start_btn_enabled = True
-                # Rebuild button in enabled style
-                self.start_btn.destroy()
-                self.start_btn = self._rounded_btn(
-                    self._start_btn_parent,
-                    "▶  Open project", self._try_open_project,
-                    bg="#4f7cff", fg="white", hover="#3b63d9",
-                    font=("Segoe UI", 12, "bold"), padx=24, pady=10, radius=10)
-                self.start_btn.pack(pady=(16, 0))
+    def _unload_file(self, ftype):
+        if not self.files[ftype]:
+            return
+        if ftype == "pnp":
+            self.pnp_parsed = {}
+            self._regroup()
+        elif ftype == "bom":
+            self.bom_data = []
+            self._regroup()
+        elif ftype == "gerber":
+            self.board_layers = None
+        self.files[ftype] = ""
+        self._update_welcome()
 
     # ══════════════════════════════════════════════════════════════════
     #  MAIN WORKSPACE
     # ══════════════════════════════════════════════════════════════════
 
     def _try_open_project(self):
-        if self.start_btn_enabled:
+        if self.files["pnp"]:
             self._switch_to_main()
 
     def _switch_to_main(self):
@@ -2216,13 +2275,34 @@ class App:
             return
         self.welcome.destroy()
         self.main_built = True
+        self.page = 0       # the file set may have changed since the last visit
         self._build_main()
         self.root.after(200, self._refresh)
 
+    def _back_to_files(self):
+        """Return to the file screen to replace or remove a loaded file."""
+        if self.exporting:
+            # the export callback still reports into this window
+            self.status.configure(text="Wait for the PDF export to finish")
+            return
+        self.root.unbind("<Escape>")
+        self.main.destroy()
+        self.main_built = False
+        self._show_welcome()
+
     def _build_main(self):
+        # One frame holds the whole workspace, so going back to the file
+        # screen removes it in a single destroy()
+        self.main = tk.Frame(self.root, bg="#0a0e1a")
+        self.main.pack(fill="both", expand=True)
+
         # Toolbar
-        tb = tk.Frame(self.root, bg="#111827", height=52)
+        tb = tk.Frame(self.main, bg="#111827", height=52)
         tb.pack(fill="x"); tb.pack_propagate(False)
+        self._rounded_btn(tb, "←  Files", self._back_to_files,
+            bg="#1a2236", fg="#8b96ab", hover="#232d45",
+            font=self.F_BTN, padx=14, min_h=self.BTN_H).pack(
+                side="left", padx=(14, 0))
         tk.Label(tb, text="▦  PCB Assembly Studio", font=self.F_BRAND,
                 fg="white", bg="#111827").pack(side="left", padx=14)
 
@@ -2239,7 +2319,7 @@ class App:
             font=self.F_BTN, padx=16, min_h=self.BTN_H)
         self.export_btn.pack(side="right", padx=14)
 
-        body = tk.Frame(self.root, bg="#0a0e1a")
+        body = tk.Frame(self.main, bg="#0a0e1a")
         body.pack(fill="both", expand=True)
 
         # Left panel: sort mode
@@ -2251,6 +2331,8 @@ class App:
         bf = tk.Frame(body, bg="#0a0e1a")
         bf.pack(side="left", fill="both", expand=True)
         self.board = BoardCanvas(bf)
+        self.board.on_click = lambda: self._set_focus(None)
+        self.root.bind("<Escape>", lambda e: self._set_focus(None))
 
         # Right panel: legend
         self.right_panel = tk.Frame(body, bg="#111827", width=320)
@@ -2258,7 +2340,7 @@ class App:
         self.right_panel.pack_propagate(False)
 
         # Status
-        self.status = tk.Label(self.root, text="", bg="#111827", fg="#8b96ab",
+        self.status = tk.Label(self.main, text="", bg="#111827", fg="#8b96ab",
             font=("Segoe UI", 9), anchor="w", padx=14)
         self.status.pack(fill="x")
 
@@ -2328,7 +2410,10 @@ class App:
         self._refresh()
 
     def _regroup(self):
-        if not self.pnp: return
+        self.pnp = {d: copy.copy(c) for d, c in self.pnp_parsed.items()}
+        if not self.pnp:
+            self.groups = {"Top": [], "Bottom": []}
+            return
 
         # Build groups from BOM or auto
         if self.bom_data:
@@ -2436,13 +2521,6 @@ class App:
         cv.create_polygon(pts, smooth=True, fill=color, outline="")
         return cv
 
-    @staticmethod
-    def _dim(hex_color, factor=0.45):
-        """Darken a #rrggbb colour — used for disabled button states."""
-        h = hex_color.lstrip("#")
-        r, g, b = (int(h[i:i+2], 16) for i in (0, 2, 4))
-        return "#%02x%02x%02x" % (int(r*factor), int(g*factor), int(b*factor))
-
     def _rounded_btn(self, parent, text, command, bg, fg="white",
                      hover=None, font=("Segoe UI", 10, "bold"),
                      padx=16, pady=7, radius=9, min_w=0, min_h=0):
@@ -2464,7 +2542,7 @@ class App:
         def draw(fill=None):
             cv.delete("all")
             if not cv._enabled:
-                fill, txt = self._dim(bg), self.C_FAINT
+                fill, txt = shade(bg), self.C_FAINT
             else:
                 fill, txt = (fill or bg), fg
             r = radius
@@ -2478,7 +2556,7 @@ class App:
         draw()
         cv.bind("<Enter>",           lambda e: draw(hover) if cv._enabled else None)
         cv.bind("<Leave>",           lambda e: draw())
-        cv.bind("<ButtonPress-1>",   lambda e: draw(self._dim(hover, .8)) if cv._enabled else None)
+        cv.bind("<ButtonPress-1>",   lambda e: draw(shade(hover, .8)) if cv._enabled else None)
         cv.bind("<ButtonRelease-1>", lambda e: (draw(hover), command()) if cv._enabled else None)
         return cv
 
@@ -2531,11 +2609,13 @@ class App:
 
         install_colors = self._install_colors()
         start = self.page * self.ROWS
+        self.legend_rows = {}
         for i, g in enumerate(sg[start:start+self.ROWS]):
             ci = start + i
             color = DNI_COLOR if g.dni else install_colors.get(ci, PALETTE[0])
 
             row = tk.Frame(self.right_panel, bg=self.C_PANEL, cursor="hand2")
+            self.legend_rows[ci] = row
             row.pack(fill="x", padx=10, pady=2)
             row.columnconfigure(1, weight=1)
 
@@ -2573,6 +2653,7 @@ class App:
                 refs_label._skip_hover = True
 
             self._bind_hover(row, g.designators)
+            self._bind_click(row, ci)
 
     def _bind_hover(self, widget, desigs):
         widget.bind("<Enter>", lambda e, dd=desigs: self.board.highlight(dd))
@@ -2581,6 +2662,29 @@ class App:
             if getattr(ch, '_skip_hover', False):
                 continue
             self._bind_hover(ch, desigs)
+
+    def _bind_click(self, widget, ci):
+        widget.bind("<Button-1>", lambda e: self._set_focus(
+            None if self.focus_group == ci else ci))
+        for ch in widget.winfo_children():
+            self._bind_click(ch, ci)
+
+    def _paint(self, widget, bg):
+        widget.configure(bg=bg)
+        for ch in widget.winfo_children():
+            self._paint(ch, bg)
+
+    def _set_focus(self, ci):
+        """Focus the board on legend group `ci` of this side, or clear with None."""
+        sg = self.groups.get(self.side, [])
+        if ci is not None and ci >= len(sg):
+            ci = None
+        if not self.main_built or ci == self.focus_group:
+            return
+        self.focus_group = ci
+        for idx, row in self.legend_rows.items():
+            self._paint(row, self.C_HOVER if idx == ci else self.C_PANEL)
+        self.board.set_focus(sg[ci].designators if ci is not None else None)
 
     def _add_tooltip(self, widget, text):
         """Show tooltip with full text on hover, clamped to screen bounds."""
@@ -2664,6 +2768,9 @@ class App:
             self.page += 1; self._refresh()
 
     def _refresh(self):
+        if not self.main_built:
+            return      # left for the file screen before the timer fired
+        self.focus_group = None     # board.load() clears the board side of it
         sg = self.groups.get(self.side, [])
         start = self.page * self.ROWS
         pg = sg[start:start+self.ROWS]
@@ -2682,7 +2789,8 @@ class App:
         top = sum(1 for c in self.pnp.values() if c.layer == "Top")
         bot = sum(1 for c in self.pnp.values() if c.layer == "Bottom")
         self.status.configure(text=f"{len(self.pnp)} comp (Top:{top} Bot:{bot}) · "
-            f"{len(sg)} groups · {self.side} · scroll=zoom drag=pan")
+            f"{len(sg)} groups · {self.side} · scroll=zoom drag=pan · "
+            f"click a legend row to focus, Esc to clear")
 
     def _sniff_type(self, path):
         """Detect the type of an imported file from its extension and contents."""
@@ -2838,12 +2946,19 @@ class App:
     def _export_pdf(self):
         if not self.pnp:
             messagebox.showinfo("Info", "Load Pick & Place first"); return
-        path = filedialog.asksaveasfilename(title="Export PDF",
-            defaultextension=".pdf", filetypes=[("PDF","*.pdf")])
-        if not path: return
+        # Setup first: the file name is built from the title entered there
         meta = self._ask_metadata()
         if meta is None: return
+        name = re.sub(r'[\\/:*?"<>|]+', "_",
+                      "Assembly drawing for %s" % meta["project"]).strip(" .")
+        # The .pdf is spelled out - a title like "Board_v4.1" would otherwise
+        # have ".1" taken for its extension
+        path = filedialog.asksaveasfilename(title="Export PDF",
+            initialfile=name + ".pdf",
+            defaultextension=".pdf", filetypes=[("PDF","*.pdf")])
+        if not path: return
         # Generate in a background thread so the GUI stays responsive
+        self.exporting = True
         self._set_btn_enabled(self.export_btn, False)
         self.status.configure(text="Generating PDF...")
         threading.Thread(target=self._export_worker, args=(path, meta),
@@ -2866,6 +2981,7 @@ class App:
             self.root.after(0, self._export_done, path, 0, str(e))
 
     def _export_done(self, path, pages, err):
+        self.exporting = False
         self._set_btn_enabled(self.export_btn, True)
         if err:
             self.status.configure(text="Export failed")

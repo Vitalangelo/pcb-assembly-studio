@@ -58,10 +58,9 @@ Millimeters or mils, auto-detected.
 **BOM** — needs **Comment, Description, Designator, Layer**. Two optional
 columns are worth exporting:
 
-- **Footprint** (also read as *Package* or *Pattern*) fills the Package column
-  of the parts list — the answer to "which 0402 is this?" — and sharpens the
-  drawn part outlines, since a name like `USON-10_2.5x1.0mm_P0.5mm` states the
-  body size outright. Pad, mask and pitch suffixes are trimmed for display.
+- **Footprint** (also read as *Package* or *Pattern*) sharpens the drawn part
+  outlines, since a name like `USON-10_2.5x1.0mm_P0.5mm` states the body size
+  outright.
 - **Part Number** (also *MPN*) fills the Part number column. Placeholders like
   `Generic` or Altium's `[NoParam],` prefix are ignored, and the Comment is
   used when no real number is there.
@@ -84,11 +83,16 @@ solder mask, `.GM1`–`.GM4`/`.GKO` outline. Cyrillic filenames inside the ZIP a
 
 ![The viewer window: board on the left, colour-coded legend with quantities and designators on the right](docs/viewer.png)
 
-**Viewer** — scroll to zoom, drag to pan. Gerber artwork as the background, colored
-component highlights, pin-1 markers on ICs, bottom layer auto-mirrored.
+**Viewer** — scroll to zoom, drag to pan. Gerber artwork as the background, solid
+colored component highlights, pin-1 markers on ICs, bottom layer auto-mirrored.
 
 **Legend** — 7 groups per page. Hover a row to light those parts up on the board,
-hover REFS for the full designator list.
+hover REFS for the full designator list. Click a row to focus it: the rest of the
+board fades almost to white and parts too small to spot get a ring around them.
+Click the row again, click the board or press Esc to clear.
+
+**Files** — the ← Files button returns to the file screen, where each loaded file
+has a ✕ to remove it. Replacing a wrong BOM no longer means restarting the app.
 
 **Sort order** — Standard (SMD passives → semiconductors → ICs → THT), as in BOM,
 or your own prefix order.
@@ -107,7 +111,7 @@ Every exported sheet is laid out as a technical drawing, not a screenshot.
 | **Sheet** — A4 / A3 / A2, landscape or portrait; 20 mm filing margin on the left, 10 mm elsewhere | ISO 5457 |
 | **Grid reference border** — 50 mm zones lettered A… down and numbered 1… across, plus centring and trimming marks | ISO 5457 |
 | **Title block** — 180 mm wide, bottom right: legal owner, title, identification no., revision, date of issue, created/approved by, document type, scale, language, sheet *n* / *m* | ISO 7200 |
-| **Parts list** — item, qty, ref. designation, part number, technical data, package, remarks | ISO 7573 |
+| **Parts list** — item, ref. designation, part number, technical data, qty, remarks | ISO 7573 |
 | **Item numbers** — encircled numerals on the colour key | ISO 6433 |
 | **Line widths** — 0.7 / 0.5 / 0.35 / 0.25 mm; **lettering** — 1.8 / 2.5 / 3.5 / 5 mm | ISO 128-20, ISO 3098 |
 | **Scale** — a real one from the 2 / 5 / 10 series, printed as `SCALE 1:1` | ISO 5455 |
@@ -148,6 +152,17 @@ headers. Only the drawing changes.
 ---
 
 ## 📝 Changelog
+
+**v1.1.1** — Click a legend row to focus that group: the board fades out around it
+and small parts get locator rings. The mouse wheel zooms the right way round. A
+← Files button returns to the file screen, where loaded files can be removed and
+replaced; Import from the workspace now refreshes the board (it silently did
+nothing before). Components are drawn solid instead of translucent, with an edge
+in a darker shade of their own colour kept thin on small parts, so groups stay
+distinguishable in print. The parts list drops the Package column and moves Qty.
+next to Remarks. The title defaults to the board name without Altium's
+"Pick Place for" prefix, and Export PDF suggests "Assembly drawing for <title>"
+as the file name.
 
 **v1.1** — ISO-format drawings. Sheet size (A4/A3/A2) and orientation are now
 chosen on export; the sheet follows ISO 5457 (border, frame, grid reference
