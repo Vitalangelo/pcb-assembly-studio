@@ -17,6 +17,9 @@ found by looking instead of reading designators.*
 
 **[PCBAssemblyStudio.exe](https://github.com/Vitalangelo/pcb-assembly-studio/releases/latest)** — one file, ~44 MB, double-click. No Python needed.
 
+The current source version is **v1.4.1**. A new executable has not been built for
+this version; use **Run from source** below to get the latest features.
+
 > Not code-signed, so Windows shows a warning on first run: **More info** → **Run anyway**.
 
 ## 🚀 Run from source
