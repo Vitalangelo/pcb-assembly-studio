@@ -110,9 +110,9 @@ columns are worth exporting:
   `Generic` or Altium's `[NoParam],` prefix are ignored, and the Comment is
   used when no real number is there.
 
-Technical data comes from Description, but only when it is under 60 characters
-— a datasheet paragraph is not table content, and the part is already named by
-the two columns beside it. Tab, `;` or `,`
+Technical data comes from Description regardless of length. The PDF shows the
+beginning that fits the cell at the normal font size, followed by an ellipsis
+when truncated; the complete description stays in the imported data. Tab, `;` or `,`
 delimiters auto-detected. DNI / DNP / "Do not place" parts are listed separately
 with a ⛔ marker and get their own PDF pages; Russian markers
 ("НЕ УСТАНАВЛИВАТЬ", "НЕ СТАВИТЬ") count too, and cp1251 files decode correctly.
@@ -258,6 +258,10 @@ headers. Only the drawing changes.
 ---
 
 ## 📝 Changelog
+
+**v1.4.3** — Technical data no longer disappears for descriptions of 60 or more
+characters. The PDF displays the prefix that fits, with an ellipsis and no font
+shrinking; the full imported description is preserved.
 
 **v1.4.2** — PDF export progress window with animation, page count and elapsed
 time; background work reports progress through a thread-safe queue. Finished

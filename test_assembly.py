@@ -17,6 +17,27 @@ def group(*refs, tech="", dni=False):
 
 
 class AssemblyTests(unittest.TestCase):
+    def test_long_technical_description_is_preserved(self):
+        description = 'MLCC 22uF 25V X5R 0805, CAP MLCC 22uF 25V 20% 0805, Cap MLCC - SMD/SMT 22uF 25VDC 20% 0805 X5R'
+        row = app._bom_row_to_result('GRM21BR61E226ME44K', description, '', 'C1', 'Top')
+        self.assertEqual(row['tech'], description)
+        row = app._bom_row_to_result('part', '  MLCC\n 22uF\t25V  ', '', 'C1', 'Top')
+        self.assertEqual(row['tech'], 'MLCC 22uF 25V')
+
+    def test_technical_data_shows_fitting_prefix_without_shrinking(self):
+        sheet = app.Sheet('A4', True)
+        try:
+            g = group('C1')
+            g.tech = 'MLCC 22uF 25V X5R 0805, CAP MLCC 22uF 25V 20% 0805, ' * 10
+            app.draw_parts_list(sheet, [(g, app.PALETTE[0], 1)], sheet.lay['rowh'])
+            label = next(t for t in sheet.ov.texts if t.get_text().startswith('MLCC'))
+            self.assertTrue(label.get_text().endswith('…'))
+            self.assertTrue(g.tech.startswith(label.get_text()[:-1]))
+            self.assertAlmostEqual(label.get_fontsize(), app.mm_font(app.H_SMALL))
+            self.assertLessEqual(sheet.measure(label.get_text(), app.H_SMALL), 43.2)
+        finally:
+            app.plt.close(sheet.fig)
+
     def test_export_publishes_finished_file_and_sends_progress(self):
         a = app.App.__new__(app.App)
         a.export_events = queue.Queue()

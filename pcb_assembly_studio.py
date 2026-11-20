@@ -61,7 +61,7 @@ PREFIX_ORDER = {
     "F": 30, "J": 31, "X": 32, "P": 33, "S": 40, "SW": 40,
 }
 
-APP_VERSION = "1.4.2"
+APP_VERSION = "1.4.3"
 
 # ---------------------------------------------------------------------------
 #  ISO drawing sheet - geometry, line widths, lettering
@@ -1017,8 +1017,8 @@ def _bom_row_to_result(comment, desc, val, desig_str, layer_raw, footprint="",
             "full_desc": full_desc, "designators": desigs, "layer": layer,
             "dni": is_dni, "footprint": footprint,
             "part_no": _clean_pn(part_no, display or comment),
-            # A Description that runs long is a datasheet blurb, not table data
-            "tech": desc if desc and len(desc) < 60 else ""}
+            # Keep the source data; the PDF cell shows the prefix that fits.
+            "tech": " ".join(desc.split()) if desc else ""}
 
 
 def parse_bom_txt(filepath):
@@ -1758,7 +1758,7 @@ def draw_parts_list(sheet, gwc, rowh):
         s.ftext(x + cols[2] + 1.4, mid, group.part_no or group.comment,
                 cols[3] - cols[2] - 2.8, h=H_SMALL)
         s.ftext(x + cols[3] + 1.4, mid, group.tech,
-                cols[4] - cols[3] - 2.8, h=H_SMALL)
+                cols[4] - cols[3] - 2.8, h=H_SMALL, min_ratio=1.0)
         s.text(x + (cols[4] + cols[5]) / 2.0, mid, str(group.quantity),
                h=H_SMALL, ha="center")
         note = STR["dni_short"] if group.dni else group.note
