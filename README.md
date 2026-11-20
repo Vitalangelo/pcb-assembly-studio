@@ -137,6 +137,11 @@ them.
 types, component sizes and installation order before using an assembly drawing.
 Footprint names and descriptions can be incomplete or misleading.
 
+For the development version, put **Gerber layers and plated/non-plated NC drill
+coordinate files into one ZIP archive** and load it once. Subfolders are supported;
+separate drill imports are not needed. Gerber-only archives can still be opened,
+but do not provide drill-based THT evidence.
+
 For **geometry-based THT recognition**, plated NC drill **coordinate files**
 (`.TXT`, `.DRL`, `.XLN`, etc.) are needed in addition to Gerber top/bottom copper
 and Pick & Place. Non-plated drill coordinates are also recommended to identify
