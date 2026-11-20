@@ -13,16 +13,12 @@ found by looking instead of reading designators.*
 
 ---
 
-## 📥 Download
-
-**[PCBAssemblyStudio.exe](https://github.com/Vitalangelo/pcb-assembly-studio/releases/latest)** — one file, ~44 MB, double-click. No Python needed.
-
-The current source version is **v1.4.1**. A new executable has not been built for
-this version; use **Run from source** below to get the latest features.
-
-> Not code-signed, so Windows shows a warning on first run: **More info** → **Run anyway**.
-
 ## 🚀 Run from source
+
+**Source distribution only for now; Python is required.** Standalone Windows
+executables are not currently offered: unsigned builds can be blocked by Windows
+Smart App Control. Code signing and a supported binary distribution channel are
+still pending. Do not disable Windows protection to run this application.
 
 1. Install [Python 3.10+](https://www.python.org/downloads/) — tick **"Add Python to PATH"**
 2. Green **Code** button above → **Download ZIP** → right-click the ZIP → **Properties** → tick **Unblock** → unzip
@@ -41,8 +37,6 @@ python pcb_assembly_studio.py
 
 Optional extras: `openpyxl` for `.xlsx` BOMs, `ezdxf` for DXF, `tkinterdnd2` for
 drag-and-drop.
-
-Want your own `.exe`? Double-click `build_exe.bat` → `dist\PCBAssemblyStudio.exe`.
 
 ---
 
@@ -206,6 +200,9 @@ window asks before closing with unsaved pages or changes.
 
 **PDF** — a proper ISO technical drawing (see below), 7 colors per page (red,
 yellow, green, cyan, blue, magenta, dark red), board artwork from Gerber.
+Export shows an animated progress window with completed page count and elapsed
+time. The destination PDF is published only after the entire export finishes;
+a failed export preserves an existing PDF at the same path.
 
 ---
 
@@ -261,6 +258,10 @@ headers. Only the drawing changes.
 ---
 
 ## 📝 Changelog
+
+**v1.4.2** — PDF export progress window with animation, page count and elapsed
+time; background work reports progress through a thread-safe queue. Finished
+PDFs replace the destination atomically, preserving previous files on failure.
 
 **v1.4.1** — One ZIP import for Gerber layers and NC drill coordinates;
 separate drill drop zones removed. Legacy project drill links still open.

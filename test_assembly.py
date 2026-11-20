@@ -1,5 +1,6 @@
 """Regression checks for installation stages, ordering, preview and PDF export."""
 import os
+import queue
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -16,6 +17,74 @@ def group(*refs, tech="", dni=False):
 
 
 class AssemblyTests(unittest.TestCase):
+    def test_export_publishes_finished_file_and_sends_progress(self):
+        a = app.App.__new__(app.App)
+        a.export_events = queue.Queue()
+        with tempfile.TemporaryDirectory() as folder:
+            destination = os.path.join(folder, 'drawing.pdf')
+            with open(destination, 'wb') as f:
+                f.write(b'previous drawing')
+
+            def render(pnp, groups, temporary, **kwargs):
+                with open(destination, 'rb') as f:
+                    self.assertEqual(f.read(), b'previous drawing')
+                with open(temporary, 'wb') as f:
+                    f.write(b'%PDF-completed')
+                kwargs['progress_callback'](1, 2)
+                kwargs['progress_callback'](2, 2)
+                return 2
+
+            with patch.object(app, 'generate_pdf', side_effect=render):
+                a._export_worker(destination, {}, {}, '', {}, None)
+            self.assertEqual(a.export_events.get_nowait(), ('progress', 1, 2))
+            self.assertEqual(a.export_events.get_nowait(), ('progress', 2, 2))
+            self.assertEqual(a.export_events.get_nowait(), ('done', destination, 2, None))
+            with open(destination, 'rb') as f:
+                self.assertEqual(f.read(), b'%PDF-completed')
+            self.assertEqual(os.listdir(folder), ['drawing.pdf'])
+
+    def test_failed_export_preserves_old_pdf_and_removes_temporary(self):
+        a = app.App.__new__(app.App)
+        a.export_events = queue.Queue()
+        with tempfile.TemporaryDirectory() as folder:
+            destination = os.path.join(folder, 'drawing.pdf')
+            with open(destination, 'wb') as f:
+                f.write(b'previous drawing')
+            with patch.object(app, 'generate_pdf', side_effect=RuntimeError('Render failed')):
+                a._export_worker(destination, {}, {}, '', {}, None)
+            self.assertEqual(a.export_events.get_nowait(), ('done', destination, 0, 'Render failed'))
+            with open(destination, 'rb') as f:
+                self.assertEqual(f.read(), b'previous drawing')
+            self.assertEqual(os.listdir(folder), ['drawing.pdf'])
+
+    def test_empty_export_does_not_publish_empty_file(self):
+        a = app.App.__new__(app.App)
+        a.export_events = queue.Queue()
+        with tempfile.TemporaryDirectory() as folder:
+            destination = os.path.join(folder, 'drawing.pdf')
+            with patch.object(app, 'generate_pdf', return_value=0):
+                a._export_worker(destination, {}, {}, '', {}, None)
+            self.assertEqual(a.export_events.get_nowait(), ('done', destination, 0, None))
+            self.assertEqual(os.listdir(folder), [])
+
+    def test_export_error_closes_progress_and_restores_export_button(self):
+        a = app.App.__new__(app.App)
+        a.exporting = True
+        a.root, a.status, a.export_btn = Mock(), Mock(), Mock()
+        a.export_dialog, a.export_progress = Mock(), Mock()
+        dialog = a.export_dialog
+        a.export_poll_id = 'timer'
+        with patch.object(app, 'messagebox') as messages, patch.object(a, '_set_btn_enabled') as enable:
+            a._export_done('drawing.pdf', 0, 'Render failed')
+        self.assertFalse(a.exporting)
+        self.assertIsNone(a.export_dialog)
+        a.export_progress.stop.assert_called_once()
+        dialog.grab_release.assert_called_once()
+        dialog.destroy.assert_called_once()
+        enable.assert_called_once_with(a.export_btn, True)
+        a.root.after_cancel.assert_called_once_with('timer')
+        messages.showerror.assert_called_once_with('Error', 'Render failed')
+
     def test_real_reported_packages_and_unknown_size(self):
         diode = part("D1", "POWERMITE")
         trimmer = part("R95", "3224W")

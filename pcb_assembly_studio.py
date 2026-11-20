@@ -13,9 +13,12 @@ import io
 import json
 import math
 import os
+import queue
 import re
 import sys
 import threading
+import tempfile
+import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from collections import defaultdict
@@ -58,7 +61,7 @@ PREFIX_ORDER = {
     "F": 30, "J": 31, "X": 32, "P": 33, "S": 40, "SW": 40,
 }
 
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.4.2"
 
 # ---------------------------------------------------------------------------
 #  ISO drawing sheet - geometry, line widths, lettering
@@ -3850,6 +3853,8 @@ class App:
         return out, chosen["view"]
 
     def _export_pdf(self):
+        if self.exporting:
+            return
         if not self.pnp:
             messagebox.showinfo("Info", "Load Pick & Place first"); return
         # Setup first: the file name is built from the title entered there
@@ -3873,28 +3878,112 @@ class App:
         self.exporting = True
         self._set_btn_enabled(self.export_btn, False)
         self.status.configure(text="Generating PDF...")
-        threading.Thread(target=self._export_worker,
-                         args=(path, meta, groups, page_name),
-                         daemon=True).start()
-
-    def _export_worker(self, path, meta, groups, page_name):
-        def progress(pn, total, *args):
-            self.root.after(0, lambda: self.status.configure(
-                text=f"PDF: page {pn}/{total}..."))
+        self.export_events = queue.Queue()
+        self._show_export_progress(path)
+        self.export_poll_id = self.root.after(100, self._poll_export)
+        # The worker never accesses Tk widgets, and uses a stable input snapshot.
+        pnp = {d: copy.copy(c) for d, c in self.pnp.items() if d not in self.excluded_refs}
         try:
-            pages = generate_pdf({d: c for d, c in self.pnp.items() if d not in self.excluded_refs}, groups, path,
+            threading.Thread(target=self._export_worker,
+                args=(path, dict(meta), copy.deepcopy(groups), page_name, pnp, self.board_layers),
+                daemon=True).start()
+        except Exception as exc:
+            self._export_done(path, 0, str(exc))
+
+    def _show_export_progress(self, path):
+        dlg = tk.Toplevel(self.root)
+        self.export_dialog = dlg
+        dlg.title("Creating PDF")
+        dlg.configure(bg=self.C_PANEL)
+        dlg.resizable(False, False)
+        dlg.transient(self.root)
+        dlg.protocol("WM_DELETE_WINDOW", lambda: None)
+        tk.Label(dlg, text="Creating PDF…", font=("Segoe UI", 14, "bold"),
+                 bg=self.C_PANEL, fg=self.C_TEXT).pack(anchor="w", padx=22, pady=(20, 6))
+        tk.Label(dlg, text=os.path.basename(path), font=self.F_SMALL,
+                 bg=self.C_PANEL, fg=self.C_MUTED, wraplength=410,
+                 justify="left").pack(anchor="w", padx=22)
+        self.export_progress = ttk.Progressbar(dlg, mode="indeterminate", length=410)
+        self.export_progress.pack(fill="x", padx=22, pady=(18, 10))
+        self.export_progress.start(15)
+        self.export_detail = tk.Label(dlg, text="Preparing drawing…", font=self.F_BODY,
+                                     bg=self.C_PANEL, fg=self.C_TEXT)
+        self.export_detail.pack(anchor="w", padx=22)
+        self.export_elapsed = tk.Label(dlg, text="Elapsed: 0 s", font=self.F_SMALL,
+                                      bg=self.C_PANEL, fg=self.C_MUTED)
+        self.export_elapsed.pack(anchor="w", padx=22, pady=(8, 4))
+        tk.Label(dlg, text="Please wait for the completion message before opening the PDF.",
+                 font=self.F_SMALL, bg=self.C_PANEL, fg=self.C_MUTED,
+                 wraplength=410, justify="left").pack(anchor="w", padx=22, pady=(0, 18))
+        self.export_started = time.monotonic()
+        dlg.update_idletasks()
+        x = self.root.winfo_rootx() + max(0, (self.root.winfo_width()-dlg.winfo_reqwidth())//2)
+        y = self.root.winfo_rooty() + max(0, (self.root.winfo_height()-dlg.winfo_reqheight())//2)
+        dlg.geometry(f"+{x}+{y}")
+        dlg.grab_set()
+
+    def _poll_export(self):
+        self.export_poll_id = None
+        if not self.exporting:
+            return
+        try:
+            while True:
+                event = self.export_events.get_nowait()
+                if event[0] == "done":
+                    self._export_done(*event[1:])
+                    return
+                _, pn, total = event
+                text = (f"Rendered {pn} of {total} pages" if pn < total else
+                        f"Finishing PDF… ({total} pages rendered)")
+                self.export_detail.configure(text=text)
+                self.status.configure(text="PDF: " + text)
+        except queue.Empty:
+            pass
+        self.export_elapsed.configure(text=f"Elapsed: {int(time.monotonic()-self.export_started)} s")
+        self.export_poll_id = self.root.after(150, self._poll_export)
+
+    def _export_worker(self, path, meta, groups, page_name, pnp, board_layers):
+        def progress(pn, total, *args):
+            self.export_events.put(("progress", pn, total))
+        temporary = None
+        try:
+            # Publish only a finished PDF. A failed export preserves any previous
+            # drawing at the destination instead of leaving a truncated file.
+            fd, temporary = tempfile.mkstemp(prefix=".pcb-assembly-", suffix=".pdf",
+                                             dir=os.path.dirname(os.path.abspath(path)))
+            os.close(fd)
+            pages = generate_pdf(pnp, groups, temporary,
                 sheet_format=meta.get("sheet_format", "A4"),
                 landscape=meta.get("orientation", "Landscape") == "Landscape",
                 scale_mode=meta.get("scale_mode", "auto"),
-                board_layers=self.board_layers,
+                board_layers=board_layers,
                 meta=meta, page_name=page_name,
                 progress_callback=progress)
-            self.root.after(0, self._export_done, path, pages, None)
+            if pages:
+                os.replace(temporary, path)
+                temporary = None
+            self.export_events.put(("done", path, pages, None))
         except Exception as e:
-            self.root.after(0, self._export_done, path, 0, str(e))
+            self.export_events.put(("done", path, 0, str(e)))
+        finally:
+            if temporary:
+                try:
+                    os.remove(temporary)
+                except OSError:
+                    pass
 
     def _export_done(self, path, pages, err):
         self.exporting = False
+        poll_id = getattr(self, 'export_poll_id', None)
+        if poll_id:
+            self.root.after_cancel(poll_id)
+            self.export_poll_id = None
+        dlg = getattr(self, 'export_dialog', None)
+        if dlg is not None:
+            self.export_progress.stop()
+            dlg.grab_release()
+            dlg.destroy()
+            self.export_dialog = None
         self._set_btn_enabled(self.export_btn, True)
         if err:
             self.status.configure(text="Export failed")
