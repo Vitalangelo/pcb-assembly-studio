@@ -10,6 +10,7 @@ import copy
 import csv
 import datetime
 import io
+import json
 import math
 import os
 import re
@@ -18,8 +19,9 @@ import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, List
+from assembly_geometry import load_gerber_evidence, load_drill_evidence, infer_geometry
 
 import matplotlib
 matplotlib.use("Agg")
@@ -56,7 +58,7 @@ PREFIX_ORDER = {
     "F": 30, "J": 31, "X": 32, "P": 33, "S": 40, "SW": 40,
 }
 
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.4.1"
 
 # ---------------------------------------------------------------------------
 #  ISO drawing sheet - geometry, line widths, lettering
@@ -269,12 +271,20 @@ class Component:
     shape: str = "rect"
     dni: bool = False
     footprint: str = ""
+    part_no: str = ""
+    size_source: str = "unknown"
+    sort_size: tuple = None
+    sort_source: str = ""
+    geometry_stage: str = ""
+    mount_source: str = ""
+    geometry_review: str = ""
 
     def __post_init__(self):
         self.prefix = extract_prefix(self.designator)
         self._estimate_size()
 
     def _estimate_size(self):
+        self.size_source = "unknown"
         # The footprint name is the most reliable size hint a BOM offers:
         # "USON-10_2.5x1.0mm_P0.5mm" beats guessing from a marketing blurb.
         desc = (self.description + " " + self.comment + " "
@@ -287,14 +297,27 @@ class Component:
         if prefix == "S" and HOLE_PATTERNS.search(desc):
             self.w, self.h, self.shape = 2.5, 2.5, "circle"; return
         pkg = {
-            "0201": (0.6, 0.3), "0402": (1.0, 0.5), "0603": (1.6, 0.8),
+            "01005": (0.4, 0.2), "0201": (0.6, 0.3), "0402": (1.0, 0.5), "0603": (1.6, 0.8),
             "0805": (2.0, 1.25), "1206": (3.2, 1.6), "1210": (3.2, 2.5),
             "2512": (6.3, 3.2), "1812": (4.5, 3.2), "2010": (5.0, 2.5),
         }
-        if prefix in ("R", "C", "L", "FB"):
-            for code, (w, h) in pkg.items():
-                if code in desc:
-                    self.w, self.h = w, h; return
+        for source in (self.footprint.upper(), self.description.upper(), self.comment.upper()):
+            dimensions = re.search(r'(\d+(?:\.\d+)?)\s*[xX×]\s*(\d+(?:\.\d+)?)\s*mm', source, re.I)
+            if dimensions:
+                self.w, self.h = map(float, dimensions.groups())
+                self.size_source = "dimensions"
+                if prefix == "U":
+                    self.shape = "ic"
+                return
+            # Manufacturer inductor series codes (e.g. WE-PD 1210) are not
+            # the imperial chip size 1210.
+            chip = prefix in ("R", "RT", "C", "FB", "D", "VD", "LED") or bool(
+                re.match(r'^(?:L|IND)[_ -]?\d{4}(?:\D|$)', self.footprint.upper()))
+            for code, (w, h) in pkg.items() if chip else ():
+                if re.search(r'(?<!\d)' + code + r'(?!\d)', source):
+                    self.w, self.h = w, h
+                    self.size_source = "package"
+                    return
         ic = {
             "FBGA": (23.0, 23.0), "896-PIN": (23.0, 23.0),
             "BGA": (12.0, 12.0),
@@ -309,7 +332,9 @@ class Component:
         }
         for pat, (w, h) in ic.items():
             if pat in desc:
-                self.w, self.h, self.shape = w, h, "ic"; return
+                self.w, self.h, self.shape = w, h, "ic"
+                self.size_source = "package estimate"
+                return
         m = re.search(r'(\d+(?:\.\d+)?)\s*x\s*(\d+(?:\.\d+)?)\s*mm', desc, re.I)
         if m:
             self.w, self.h = float(m.group(1)), float(m.group(2))
@@ -341,6 +366,7 @@ class ComponentGroup:
     dni: bool = False
     part_no: str = ""
     tech: str = ""
+    stage: str = "SMT"
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -468,7 +494,8 @@ def _parse_pnp_delimited(lines, delim, default_factor):
             components[desig] = Component(
                 designator=desig, layer=normalize_layer(layer_raw),
                 x=x, y=y, rotation=rot,
-                comment=cell("comment"), description=cell("description"))
+                comment=cell("comment"), description=cell("description"),
+                footprint=cell("footprint"))
         except (ValueError, IndexError):
             continue
     return components
@@ -540,7 +567,8 @@ def _parse_pnp_fixed(lines, header_idx, hdr, default_factor):
                 y=_coord(y_str, default_factor),
                 rotation=float(rot_str),
                 comment=get_field(line, "comment"),
-                description=get_field(line, "description"))
+                description=get_field(line, "description"),
+                footprint=get_field(line, "footprint"))
         except (ValueError, IndexError):
             continue
     return components
@@ -1078,7 +1106,8 @@ def group_from_bom(bom_rows, pnp):
                 comp = pnp[d]
                 comp.comment = row["comment"]
                 comp.description = row["description"]
-                comp.footprint = row["footprint"]
+                comp.footprint = row["footprint"] or comp.footprint
+                comp.part_no = row["part_no"]
                 comp.dni = row["dni"]
                 comp._estimate_size()
                 per_layer[comp.layer].append(d)
@@ -1115,6 +1144,127 @@ def group_auto(pnp):
                 part_no=prefix))
         result[layer] = groups
     return result
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  CUSTOM PAGES — a drawing of only the designators typed in
+# ═══════════════════════════════════════════════════════════════════════
+
+_REF_NUMBERED = re.compile(r"^([A-Z]+)(\d+)$")
+_REF_RANGE = re.compile(r"^([A-Za-z]+)(\d+)-([A-Za-z]*)(\d+)$")
+
+
+def parse_refs(text, known):
+    """Designators typed for a custom page -> (found, not_found).
+
+    Commas, semicolons, spaces and new lines all separate. "R7-R12" and
+    "R7-12" are ranges, and pick whichever members exist - gaps in numbering
+    are normal. A single designator that does not exist is reported back, so
+    is a range with no members at all. Case is ignored.
+    """
+    by_upper = {d.upper(): d for d in known}
+    numbered = defaultdict(list)            # "R" -> [(7, "R7"), ...]
+    for up, d in by_upper.items():
+        m = _REF_NUMBERED.match(up)
+        if m:
+            numbered[m.group(1)].append((int(m.group(2)), d))
+    text = re.sub(r"\s*[-–]\s*", "-", str(text or ""))   # "R7 – R12"
+    found, missing, seen = [], [], set()
+    for tok in re.split(r"[,;\s]+", text):
+        if not tok:
+            continue
+        hits = []
+        if tok.upper() in by_upper:         # before ranges: "U1-1" may be a name
+            hits = [by_upper[tok.upper()]]
+        else:
+            m = _REF_RANGE.match(tok)
+            if m and m.group(3).upper() in ("", m.group(1).upper()):
+                lo, hi = sorted((int(m.group(2)), int(m.group(4))))
+                hits = [d for n, d in sorted(numbered[m.group(1).upper()])
+                        if lo <= n <= hi]
+        if not hits and tok not in missing:
+            missing.append(tok)
+        for d in hits:
+            if d not in seen:
+                seen.add(d)
+                found.append(d)
+    return found, missing
+
+
+def page_groups(groups_by_layer, designators):
+    """The drawing's groups cut down to `designators`.
+
+    Grouping, order and colours follow the full drawing's rules, so a part
+    looks the same on a custom page as anywhere else - only fewer of them.
+    """
+    wanted = set(designators)
+    result = {}
+    for layer, groups in groups_by_layer.items():
+        kept = []
+        for g in groups:
+            ds = [d for d in g.designators if d in wanted]
+            if ds:
+                kept.append(replace(g, designators=ds, quantity=len(ds)))
+        if kept:
+            result[layer] = kept
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  PROJECT FILES — loaded files, settings and custom pages as JSON
+# ═══════════════════════════════════════════════════════════════════════
+
+PROJECT_EXT = ".pcbasm"
+PROJECT_FORMAT = 4
+# Title block and sheet fields a project remembers. The date of issue is left
+# out on purpose: it belongs to an issue of the drawing, not to the project.
+PROJECT_META_KEYS = ("project", "owner", "doc_no", "edition", "designer",
+                     "approver", "sheet_format", "orientation", "scale_mode")
+
+
+def file_ref(path, project_dir):
+    """How a project stores a loaded file: a path relative to the project
+    file, so the folder can be moved or copied as a whole, and the absolute
+    path as a fallback for when only the project file was moved."""
+    ref = {"abs": os.path.abspath(path)}
+    try:
+        ref["rel"] = os.path.relpath(path, project_dir).replace(os.sep, "/")
+    except ValueError:      # another drive on Windows - there is no relative path
+        pass
+    return ref
+
+
+def resolve_file_ref(ref, project_dir):
+    """Path of a stored file as it exists now, or None when it is gone."""
+    candidates = []
+    if ref.get("rel"):
+        candidates.append(os.path.join(project_dir, ref["rel"]))
+    if ref.get("abs"):
+        candidates.append(ref["abs"])
+    for c in candidates:
+        if os.path.isfile(c):
+            return os.path.normpath(c)
+    return None
+
+
+def write_project(path, data):
+    """Write through a temporary file, so a failed save cannot leave a
+    half-written project in place of the good one."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def read_project(path):
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict) or "files" not in data:
+        raise ValueError("Not a PCB Assembly Studio project:\n" + path)
+    if data.get("format", 1) > PROJECT_FORMAT:
+        raise ValueError("This project was saved by a newer version of "
+                         "PCB Assembly Studio. Update the app to open it.")
+    return data
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1614,7 +1764,7 @@ def draw_parts_list(sheet, gwc, rowh):
 
 
 def draw_board_view(sheet, pnp, gwc, layer, bounds, scale, scale_txt,
-                    board_layers=None):
+                    board_layers=None, page_name=""):
     """The board itself, drawn at exactly `scale` paper-mm per board-mm."""
     bx, by, bw, bh = sheet.lay["board"]
     x_min, x_max, y_min, y_max = bounds
@@ -1685,6 +1835,8 @@ def draw_board_view(sheet, pnp, gwc, layer, bounds, scale, scale_txt,
     # View caption and scale designation (ISO 5455: the word SCALE + the ratio)
     cx_, cy_ = sheet.lay["caption"]
     view = STR["view_bottom"] if layer == "Bottom" else STR["view_top"]
+    if page_name:
+        view = "%s · %s" % (page_name, view)
     scale_note = "%s %s" % (STR["tb_scale"].split(" / ")[0].upper(), scale_txt)
     sheet.text(sheet.x1 - 1.0, cy_, scale_note, h=H_MID, ha="right",
                fontweight="bold")
@@ -1696,22 +1848,131 @@ def draw_board_view(sheet, pnp, gwc, layer, bounds, scale, scale_txt,
 #  PDF GENERATION
 # ═══════════════════════════════════════════════════════════════════════
 
-def detect_mount_type(groups):
-    tht_kw = ["THT","DIP","PIN HEADER","CONNECTOR","SIP","TO-220","VERTICAL","RIGHT ANGLE","R/A"]
-    has_smt = has_tht = False
-    for g in groups:
-        if any(k in (g.description+" "+g.comment).upper() for k in tht_kw):
-            has_tht = True
-        else: has_smt = True
-    if has_smt and has_tht: return "SMT/THT"
-    return "THT" if has_tht else "SMT"
+def valid_size_overrides(data):
+    result = {}
+    if not isinstance(data, dict):
+        return result
+    for d, size in data.items():
+        try:
+            w, h = size
+            w, h = float(w), float(h)
+            if math.isfinite(w) and math.isfinite(h) and w > 0 and h > 0:
+                result[str(d)] = [w, h]
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def apply_size_overrides(pnp, sizes):
+    for d, (w, h) in valid_size_overrides(sizes).items():
+        if d in pnp:
+            pnp[d].w, pnp[d].h, pnp[d].size_source = w, h, "manual"
+            pnp[d].sort_size, pnp[d].sort_source = (w, h), "manual"
+
+
+def component_stage(comp, group):
+    """Explicit technology wins; connector names alone do not imply THT."""
+    def result(stage, source):
+        if comp:
+            comp.mount_source = source
+            if comp.geometry_stage and comp.geometry_stage != stage:
+                comp.mount_source += " / geometry conflict — review"
+        return stage
+    for text in (group.tech, comp.footprint if comp else "",
+                 group.description + " " + group.comment):
+        text = text.upper().replace("_", " ")
+        if re.search(r"\b(SMD|SMT|SURFACE[ -]MOUNT)\b", text):
+            return result("SMT", "file text")
+        if re.search(r"\b(THT|TH|PTH|THROUGH[ -]HOLE|DIP\d*|PDIP\d*|SIP\d*)\b|TO[-_ ]?220", text):
+            return result("THT", "file text")
+        if re.search(r"\bDIP\d+(?:SW)?\b", text):
+            return result("THT", "package hint — review")
+    if comp and comp.geometry_stage:
+        return result(comp.geometry_stage, "PTH + copper — inferred")
+    text = " ".join((comp.footprint if comp else "", group.description, group.comment)).upper().replace("_", " ")
+    # Solder bridges and zero-ohm jumpers are not pin headers.
+    if re.search(r"SOLDER\s*(JUMPER|BRIDGE)|\b0\s*(OHM|Ω)\b", text):
+        return result("SMT", "name hint — review")
+    if re.search(r"PIN[ -]?HEADER|PIN[ -]?SOCKET|SOCKET[ -]?HEADER|\bJUMPERS?\b|ПЕРЕМЫЧК", text):
+        return result("THT", "name hint — review")
+    return result("SMT", "unconfirmed — review")
+
+
+def assembly_groups(groups, pnp, overrides=None, order=None, sort_mode="standard", excluded=None):
+    """Split BOM rows by size and installation stage, preserving board side."""
+    overrides = overrides or {}
+    excluded = set(excluded or [])
+    ranks = {d: i for i, d in enumerate(order or [])}
+    result = {}
+    for side, gs in groups.items():
+        split = []
+        for g in gs:
+            buckets = {}
+            for d in g.designators:
+                if d in excluded:
+                    continue
+                c = pnp.get(d)
+                stage = overrides.get(d) or component_stage(c, g)
+                if stage not in ("SMT", "THT", "Manual"):
+                    stage = component_stage(c, g)
+                size = tuple(round(v, 4) for v in (c.sort_size or (c.w,c.h))) if c else (float("inf"), float("inf"))
+                # An explicitly ordered part can be moved independently of its BOM row.
+                key = (stage, size)
+                buckets.setdefault(key, []).append(d)
+            for (stage, size), ds in buckets.items():
+                if ranks:
+                    ds.sort(key=lambda d: ranks.get(d, len(ranks)))
+                runs = []
+                for d in ds:
+                    if (not runs or (d in ranks and runs[-1][-1] in ranks and
+                                     ranks[d] != ranks[runs[-1][-1]] + 1)):
+                        runs.append([])
+                    runs[-1].append(d)
+                for run in runs:
+                    split.append(replace(g, designators=run, quantity=len(run), stage=stage))
+        if sort_mode == "standard":
+            def size_key(g):
+                cs = [pnp[d] for d in g.designators if d in pnp]
+                dims = [c.sort_size or (c.w,c.h) for c in cs]
+                size = max(((w*h, max(w,h)) for w,h in dims), default=(float("inf"), float("inf")))
+                unknown = not cs or any(not c.sort_size and c.size_source == "unknown" for c in cs)
+                return (unknown,) + size + (natural_sort_key(g.designators[0]),)
+            split.sort(key=size_key)
+        if ranks:
+            split.sort(key=lambda g: min((ranks.get(d, len(ranks)) for d in g.designators), default=len(ranks)))
+        split.sort(key=lambda g: g.dni)
+        result[side] = split
+    return result
+
+
+def assembly_sections(groups):
+    """The same sections drive the preview and PDF, with local sheet numbers."""
+    sections = []
+    for stage, sides in (("SMT", ("Bottom",)), ("SMT", ("Top",)),
+                         ("THT / Manual", ("Bottom", "Top"))):
+        sheets = []
+        for side in sides:
+            gs = [g for g in groups.get(side, [])
+                  if (g.stage == "SMT") == (stage == "SMT")]
+            for dni in (False, True):
+                indexed = [(i, g) for i, g in enumerate(gs) if g.dni == dni]
+                for start in range(0, len(indexed), ROWS_PER_PAGE):
+                    chunk = indexed[start:start + ROWS_PER_PAGE]
+                    gwc = [(g, DNI_COLOR if dni else PALETTE[i % len(PALETTE)], i + 1)
+                           for i, g in chunk]
+                    sheets.append((side, STR["dni_page"] if dni else stage, gwc))
+        if sheets:
+            sections.append((stage, sheets))
+    return sections
 
 
 def generate_pdf(pnp, groups_by_layer, output_path,
                  project_name="Project", designed_by="", edition="A",
                  progress_callback=None, board_layers=None,
                  sheet_format="A4", landscape=True, scale_mode="auto",
-                 meta=None):
+                 meta=None, page_name=""):
+    """`page_name` marks a custom page: it heads the view caption and the
+    title block's supplementary title on every sheet."""
     bounds = compute_bounds(pnp, board_layers, margin=2.0)
     lay = sheet_layout(sheet_format, landscape)
     _bx, _by, area_w, area_h = lay["board"]
@@ -1724,38 +1985,22 @@ def generate_pdf(pnp, groups_by_layer, output_path,
     info.setdefault("date", datetime.date.today().isoformat())
 
     plan = []
-    for layer in ["Bottom", "Top"]:
-        groups = groups_by_layer.get(layer)
-        if not groups: continue
-        install = [g for g in groups if not g.dni]
-        dni_groups = [g for g in groups if g.dni]
-        mt = detect_mount_type(install or groups)
-        # Assembly pages: colour by RUNNING group index on the side -
-        # exactly how the GUI numbers them, so colours always match.
-        for i in range(0, len(install), ROWS_PER_PAGE):
-            chunk = install[i:i+ROWS_PER_PAGE]
-            gwc = [(g, PALETTE[(i + j) % len(PALETTE)], i + j + 1)
-                   for j, g in enumerate(chunk)]
-            plan.append((layer, mt, gwc))
-        # DNI parts get their own pages at the end of each side, grey and hatched
-        base = len(install)
-        for i in range(0, len(dni_groups), ROWS_PER_PAGE):
-            chunk = dni_groups[i:i+ROWS_PER_PAGE]
-            gwc = [(g, DNI_COLOR, base + i + j + 1) for j, g in enumerate(chunk)]
-            plan.append((layer, STR["dni_page"], gwc))
+    for _, sheets in assembly_sections(groups_by_layer):
+        for local_page, (layer, mt, gwc) in enumerate(sheets, 1):
+            plan.append((layer, mt, gwc, local_page, len(sheets)))
     total = len(plan)
     if total == 0: return 0
 
     with PdfPages(output_path) as pdf:
-        for pn, (layer, mt, gwc) in enumerate(plan, 1):
+        for pn, (layer, mt, gwc, local_page, section_total) in enumerate(plan, 1):
             sheet = Sheet(sheet_format, landscape)
             draw_frame(sheet)
             draw_board_view(sheet, pnp, gwc, layer, bounds, scale, scale_txt,
-                            board_layers=board_layers)
+                            board_layers=board_layers, page_name=page_name)
             draw_parts_list(sheet, gwc, lay["rowh"])
             view = STR["view_bottom"] if layer == "Bottom" else STR["view_top"]
-            draw_title_block(sheet, info, pn, total,
-                             "%s · %s" % (view, mt), scale_txt)
+            sub = [page_name, view, mt] if page_name else [view, mt]
+            draw_title_block(sheet, info, local_page, section_total, " · ".join(sub), scale_txt)
             pdf.savefig(sheet.fig)
             plt.close(sheet.fig)
             if progress_callback:
@@ -2075,9 +2320,23 @@ class App:
 
     def __init__(self, root):
         self.root = root
-        self.root.title(f"PCB Assembly Studio v{APP_VERSION}")
         self.root.geometry("1200x750")
         self.root.configure(bg="#0a0e1a")
+        self.main_built = False
+        self.exporting = False
+        self.focus_group = None  # legend index of the clicked group on this side
+        self.legend_rows = {}    # legend index -> row frame on the current page
+        self._reset_project()
+        # Ctrl+S matched by key code (83 = VK_S on Windows), not by <Control-s>:
+        # with a Cyrillic layout the keysym is "ы" and <Control-s> never fires.
+        # One binding only, so the save dialog cannot open twice.
+        self.root.bind("<Control-KeyPress>", lambda e: self._save_project()
+                       if e.keycode == 83 or e.keysym.lower() == "s" else None)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._show_welcome()
+
+    def _reset_project(self):
+        """Everything a project holds, back to an empty, unsaved state."""
         self.pnp = {}; self.bom_data = []; self.groups = {"Top":[],"Bottom":[]}
         # Pick & Place as parsed. BOM grouping writes into the components, so
         # every regroup starts from a copy of this - a replaced BOM leaves no trace.
@@ -2085,18 +2344,43 @@ class App:
         self.side = "Bottom"; self.page = 0; self.board_layers = None
         self.sort_mode = "standard"  # standard | bom | custom
         self.custom_order = []  # user-defined prefix order
-        self.main_built = False
-        self.exporting = False
-        self.files = {"pnp": "", "bom": "", "gerber": ""}   # loaded file paths
+        self.stage = "SMT"
+        self.mount_overrides = {}
+        self.assembly_order = []
+        self.excluded_refs = set()
+        self.size_overrides = {}
+        self.installation_groups = {}
+        self.geometry_evidence = {}
+        self.archive_drill_evidence = {}
+        self.drill_evidence = {}
+        self.npth_evidence = {}
+        self.geometry_warnings = []
+        self.files = {"pnp": "", "bom": "", "gerber": "", "drill": "", "npth": ""}
         self.auto_project = ""  # title taken from the P&P name, not typed in
-        self.focus_group = None  # legend index of the clicked group on this side
-        self.legend_rows = {}    # legend index -> row frame on the current page
+        self.pages = []         # custom pages: {"name": ..., "refs": typed text}
+        self.view = None        # index into self.pages, None = full drawing
+        self.shown = {}         # groups by layer for the current view
+        self.project_path = ""
+        self.dirty = False
         self.meta = {"project": "Assembly", "designer": "", "edition": "A",
                      "owner": "", "doc_no": "", "approver": "",
                      "sheet_format": "A4", "orientation": "Landscape",
                      "scale_mode": "auto",
                      "date": datetime.date.today().isoformat()}
-        self._show_welcome()
+        self._update_title()
+
+    def _update_title(self):
+        name = ""
+        if self.project_path:
+            name = " — " + os.path.basename(self.project_path)
+            if self.dirty:
+                name += " *"
+        self.root.title(f"PCB Assembly Studio v{APP_VERSION}{name}")
+
+    def _mark_dirty(self):
+        if not self.dirty:
+            self.dirty = True
+            self._update_title()
 
     # ══════════════════════════════════════════════════════════════════
     #  WELCOME SCREEN
@@ -2115,7 +2399,7 @@ class App:
         self.file_dots = {}
         for key, name, ext in [("pnp","Pick & Place  (required)",".txt / .csv / .pos"),
                                 ("bom","BOM",".txt / .csv / .xlsx"),
-                                ("gerber","Gerber ZIP / DXF",".zip / .dxf")]:
+                                ("gerber","Gerber + NC drill ZIP / DXF",".zip / .dxf")]:
             row = tk.Frame(left, bg="#111827"); row.pack(fill="x", padx=16, pady=3)
             dot = tk.Label(row, text="●", font=("Segoe UI", 12), fg="#f59e0b", bg="#111827")
             dot.pack(side="left", padx=(0, 8))
@@ -2138,11 +2422,21 @@ class App:
         right = tk.Frame(self.welcome, bg="#0a0e1a")
         right.pack(side="left", fill="both", expand=True, padx=20, pady=20)
 
+        if self.project_path:
+            proj = tk.Frame(right, bg="#0a0e1a")
+            proj.pack(fill="x", pady=(0, 8))
+            tk.Label(proj, text="Project  " + os.path.basename(self.project_path),
+                     font=self.F_BTN, fg=self.C_TEXT, bg="#0a0e1a").pack(side="left")
+            # Without closing, Save would write different files into this project
+            self._rounded_btn(proj, "Close project", self._close_project,
+                bg=self.C_CARD, fg=self.C_MUTED, hover=self.C_HOVER,
+                font=self.F_SMALL, padx=12, pady=4, radius=7).pack(side="right")
+
         self.drop_zones = {}
         for key, title, ftypes, exts in [
             ("pnp", "Pick & Place", [("Text/CSV/POS","*.txt *.csv *.pos")], ".txt .csv .pos"),
             ("bom", "BOM", [("Text/CSV/Excel","*.txt *.csv *.xlsx *.xls")], ".txt .csv .xlsx"),
-            ("gerber", "Gerber ZIP / DXF", [("ZIP/DXF","*.zip *.dxf *.dwg")], ".zip .dxf"),
+            ("gerber", "Gerber + NC drill ZIP / DXF", [("ZIP/DXF","*.zip *.dxf *.dwg")], ".zip .dxf"),
         ]:
             zone = tk.Frame(right, bg="#111827", highlightthickness=2,
                            highlightbackground="#334155", cursor="hand2")
@@ -2193,12 +2487,18 @@ class App:
             zone.bind("<Enter>", lambda e, z=zone: z.configure(highlightbackground="#3b82f6"))
             zone.bind("<Leave>", lambda e, z=zone: z.configure(highlightbackground="#334155"))
 
-        # Open button - greyed out until a Pick & Place is loaded
-        self.start_btn = self._rounded_btn(right, "▶  Open project",
-            self._try_open_project,
+        bar = tk.Frame(right, bg="#0a0e1a")
+        bar.pack(pady=(16, 0))
+        # Continue - greyed out until a Pick & Place is loaded
+        self.start_btn = self._rounded_btn(bar, "▶  Continue",
+            self._try_continue,
             bg="#4f7cff", fg="white", hover="#3b63d9",
             font=("Segoe UI", 12, "bold"), padx=24, pady=10, radius=10)
-        self.start_btn.pack(pady=(16, 0))
+        self.start_btn.pack(side="left")
+        self._rounded_btn(bar, "📂  Open project…", self._open_project,
+            bg=self.C_CARD, fg=self.C_MUTED, hover=self.C_HOVER,
+            font=("Segoe UI", 12, "bold"), padx=20, pady=10, radius=10).pack(
+                side="left", padx=(12, 0))
 
         tk.Label(right, text="100% offline · all files stay on your computer",
                 font=("Segoe UI", 8), fg="#334155", bg="#0a0e1a").pack(
@@ -2211,6 +2511,8 @@ class App:
         if self.main_built:
             return      # files imported from the workspace - no welcome screen
         for k, path in self.files.items():
+            if k not in self.file_dots:
+                continue  # legacy projects may link separate drill files
             self.file_dots[k].configure(fg="#22c55e" if path else "#f59e0b")
             title, lbl, clear = self.drop_zones[k]
             if path:
@@ -2241,11 +2543,29 @@ class App:
                 self.bom_data = bom
                 self._regroup()
             elif ftype == "gerber":
-                self.board_layers = load_board_drawing(path)
+                drawing = load_board_drawing(path)
+                evidence = load_gerber_evidence(path) if path.lower().endswith('.zip') else {}
+                drills = load_drill_evidence(path, required=False) if path.lower().endswith('.zip') else {}
+                self.board_layers, self.geometry_evidence = drawing, evidence
+                self.archive_drill_evidence = drills
+                # Replacing the bundle must not retain drilling from another board.
+                self.drill_evidence, self.npth_evidence = {}, {}
+                self.files['drill'], self.files['npth'] = '', ''
+                self._regroup()
+            elif ftype in ("drill", "npth"):
+                evidence = load_drill_evidence(path)
+                if ftype == "drill":
+                    self.drill_evidence = evidence
+                else:
+                    self.npth_evidence = evidence
+                self._regroup()
+                if evidence.get('warnings'):
+                    messagebox.showwarning("Drill data needs review", "\n".join(evidence['warnings'][:5]))
         except Exception as e:
             messagebox.showerror("Error", str(e))
             return
         self.files[ftype] = path
+        self._mark_dirty()
         self._update_welcome()
 
     def _unload_file(self, ftype):
@@ -2259,14 +2579,147 @@ class App:
             self._regroup()
         elif ftype == "gerber":
             self.board_layers = None
+            self.geometry_evidence = {}
+            self.archive_drill_evidence = {}
+            self._regroup()
+        elif ftype in ("drill", "npth"):
+            if ftype == "drill": self.drill_evidence = {}
+            else: self.npth_evidence = {}
+            self._regroup()
         self.files[ftype] = ""
+        self._mark_dirty()
         self._update_welcome()
+
+    # ══════════════════════════════════════════════════════════════════
+    #  PROJECT FILE
+    # ══════════════════════════════════════════════════════════════════
+
+    def _save_project(self):
+        """Save to the current project file, asking for one the first time.
+        Returns True when the project was written."""
+        path = self.project_path
+        if not path:
+            name = re.sub(r'[\\/:*?"<>|]+', "_", self.meta.get("project", "")).strip(" .")
+            path = filedialog.asksaveasfilename(title="Save project",
+                initialfile=(name or "Assembly") + PROJECT_EXT,
+                # next to the P&P, so the stored relative paths stay short
+                initialdir=os.path.dirname(self.files["pnp"]) or None,
+                defaultextension=PROJECT_EXT,
+                filetypes=[("PCB Assembly Studio project", "*" + PROJECT_EXT)])
+            if not path:
+                return False
+        folder = os.path.dirname(os.path.abspath(path))
+        data = {
+            "app": "PCB Assembly Studio", "version": APP_VERSION,
+            "format": PROJECT_FORMAT,
+            "files": {k: file_ref(p, folder) for k, p in self.files.items() if p},
+            "sort_mode": self.sort_mode,
+            "custom_order": self.custom_order,
+            "meta": {k: self.meta.get(k, "") for k in PROJECT_META_KEYS},
+            "pages": self.pages,
+            "mount_overrides": self.mount_overrides,
+            "assembly_order": self.assembly_order,
+            "excluded_refs": sorted(self.excluded_refs),
+            "size_overrides": self.size_overrides,
+        }
+        try:
+            write_project(path, data)
+        except OSError as e:
+            messagebox.showerror("Error", "Could not save the project:\n%s" % e)
+            return False
+        self.project_path = path
+        self.dirty = False
+        self._update_title()
+        if self.main_built:
+            self.status.configure(text="Saved → " + os.path.basename(path))
+        return True
+
+    def _confirm_discard(self):
+        """True when the current project may be dropped: nothing worth keeping
+        is unsaved, or the user saved it or chose not to."""
+        if not self.dirty or not (self.project_path or self.pages):
+            return True
+        ans = messagebox.askyesnocancel("Unsaved changes",
+            "Save changes to the project before closing it?")
+        if ans is None:
+            return False
+        return self._save_project() if ans else True
+
+    def _on_close(self):
+        if self.exporting:
+            # a half-written PDF is worse than a second click
+            self.status.configure(text="Wait for the PDF export to finish")
+            return
+        if self._confirm_discard():
+            self.root.destroy()
+
+    def _close_project(self):
+        if not self._confirm_discard():
+            return
+        self._reset_project()
+        self.welcome.destroy()
+        self._show_welcome()
+
+    def _open_project(self):
+        if not self._confirm_discard():
+            return
+        path = filedialog.askopenfilename(title="Open project",
+            filetypes=[("PCB Assembly Studio project", "*" + PROJECT_EXT),
+                       ("All", "*.*")])
+        if not path:
+            return
+        try:
+            data = read_project(path)
+        except (OSError, ValueError) as e:
+            messagebox.showerror("Error", str(e))
+            return
+        self._reset_project()
+        self.project_path = path
+        self.welcome.destroy()
+        self._show_welcome()
+        folder = os.path.dirname(os.path.abspath(path))
+        self.meta.update({k: v for k, v in (data.get("meta") or {}).items()
+                          if k in PROJECT_META_KEYS})
+        self.sort_mode = data.get("sort_mode", "standard")
+        self.custom_order = list(data.get("custom_order") or [])
+        self.mount_overrides = {str(d): s for d, s in (data.get("mount_overrides") or {}).items()
+                                if s in ("SMT", "THT", "Manual")}
+        self.assembly_order = list(dict.fromkeys(str(d) for d in data.get("assembly_order") or []))
+        self.excluded_refs = set(str(d) for d in data.get("excluded_refs") or [])
+        self.size_overrides = valid_size_overrides(data.get("size_overrides"))
+        self.pages = [{"name": str(p.get("name", "")), "refs": str(p.get("refs", ""))}
+                      for p in data.get("pages") or []]
+        relocated = False
+        names = {"pnp": "Pick & Place", "bom": "BOM", "gerber": "Gerber / DXF",
+                 "drill": "Plated drills", "npth": "Non-plated drills"}
+        for ftype in ("pnp", "bom", "gerber", "drill", "npth"):
+            ref = (data.get("files") or {}).get(ftype)
+            if not ref:
+                continue
+            found = resolve_file_ref(ref, folder)
+            if not found:
+                if not messagebox.askyesno("File not found",
+                        "The %s file of this project was not found:\n%s\n\n"
+                        "Locate it?" % (names[ftype], ref.get("abs", ref.get("rel")))):
+                    continue
+                found = filedialog.askopenfilename(title="Locate " + names[ftype],
+                                                   initialdir=folder)
+                if not found:
+                    continue
+                relocated = True
+            self._load_file_typed(ftype, found)
+        # A file found in a new place is a change the project should remember
+        self.dirty = relocated
+        self._update_title()
+        self._update_welcome()
+        if self.files["pnp"]:
+            self._switch_to_main()
 
     # ══════════════════════════════════════════════════════════════════
     #  MAIN WORKSPACE
     # ══════════════════════════════════════════════════════════════════
 
-    def _try_open_project(self):
+    def _try_continue(self):
         if self.files["pnp"]:
             self._switch_to_main()
 
@@ -2314,6 +2767,9 @@ class App:
             bg="#1a2236", fg="#8b96ab", hover="#232d45",
             font=self.F_BTN, padx=14, min_h=self.BTN_H).pack(
                 side="left", padx=8)
+        self._rounded_btn(tb, "💾  Save", self._save_project,
+            bg="#1a2236", fg="#8b96ab", hover="#232d45",
+            font=self.F_BTN, padx=14, min_h=self.BTN_H).pack(side="left")
         self.export_btn = self._rounded_btn(tb, "📄  Export PDF",
             self._export_pdf, bg="#10b981", hover="#0d9668",
             font=self.F_BTN, padx=16, min_h=self.BTN_H)
@@ -2354,7 +2810,7 @@ class App:
                 anchor="w").pack(fill="x", padx=14, pady=(14, 8))
 
         modes = [
-            ("standard", "Standard", "SMD passive → ICs → THT", "#3b82f6"),
+            ("standard", "Smallest first", "All types, increasing body size", "#3b82f6"),
             ("bom", "As in BOM", "Original BOM order", "#a855f7"),
             ("custom", "Custom", "User-defined order", "#f59e0b"),
         ]
@@ -2403,7 +2859,210 @@ class App:
                     r_(canvas=c, fill=b))
             cv.bind("<Button-1>", lambda e, m=mode_id: self._set_sort(m))
 
+        tk.Label(self.left_panel, text="ASSEMBLY PREVIEW", bg=self.C_PANEL,
+                 fg=self.C_MUTED, font=self.F_SMALL).pack(pady=(12, 4))
+        stage = ttk.Combobox(self.left_panel, state="readonly", width=22,
+                            values=("SMT", "THT / Manual"))
+        stage.set(self.stage)
+        stage.pack(padx=14, fill="x")
+        stage.bind("<<ComboboxSelected>>", lambda e: self._set_stage(stage.get()))
+        self._rounded_btn(self.left_panel, "Edit installation…", self._assembly_dialog,
+            bg=self.C_CARD, fg=self.C_TEXT, hover=self.C_HOVER,
+            font=self.F_SMALL).pack(padx=14, pady=8, fill="x")
+        self._build_pages()
+
+    # ── Left panel: custom pages ──────────────────────────────────────
+
+    def _build_pages(self):
+        head = tk.Frame(self.left_panel, bg=self.C_PANEL)
+        head.pack(fill="x", padx=14, pady=(18, 6))
+        tk.Label(head, text="PAGES", font=("Segoe UI", 9, "bold"),
+                 fg=self.C_MUTED, bg=self.C_PANEL).pack(side="left")
+        add = tk.Label(head, text="+ New", font=("Segoe UI", 9, "bold"),
+                       fg=self.C_ACCENT, bg=self.C_PANEL, cursor="hand2")
+        add.pack(side="right")
+        add.bind("<Button-1>", lambda e: self._page_dialog())
+
+        # The list scrolls once there are more pages than fit under the cards
+        cv = tk.Canvas(self.left_panel, bg=self.C_PANEL, highlightthickness=0,
+                       yscrollincrement=34)
+        cv.pack(fill="both", expand=True, padx=14, pady=(0, 10))
+        inner = tk.Frame(cv, bg=self.C_PANEL)
+        win = cv.create_window(0, 0, window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
+        cv.bind("<Configure>", lambda e: cv.itemconfigure(win, width=e.width))
+
+        full = sum(g.quantity for gs in self.groups.values() for g in gs)
+        rows = [(None, "Full drawing", full)]
+        for i, p in enumerate(self.pages):
+            groups, _missing = self._page_view(i)
+            rows.append((i, p["name"], sum(g.quantity for gs in groups.values()
+                                           for g in gs)))
+        for idx, name, count in rows:
+            sel = idx == self.view
+            bg = self.C_HOVER if sel else self.C_CARD
+            row = tk.Frame(inner, bg=bg, height=30, cursor="hand2")
+            row.pack(fill="x", pady=2)
+            row.pack_propagate(False)
+            tk.Frame(row, bg=self.C_ACCENT if sel else bg, width=3).pack(
+                side="left", fill="y")
+            if idx is not None:
+                for sym, cmd, hot in (("✕", self._delete_page, "#f87171"),
+                                      ("✏", self._page_dialog, self.C_TEXT)):
+                    b = tk.Label(row, text=sym, font=self.F_SMALL,
+                                 fg=self.C_MUTED, bg=bg, cursor="hand2")
+                    b.pack(side="right", padx=(0, 6))
+                    b.bind("<Button-1>", lambda e, c=cmd, i=idx: c(i))
+                    b.bind("<Enter>", lambda e, w=b, h=hot: w.configure(fg=h))
+                    b.bind("<Leave>", lambda e, w=b: w.configure(fg=self.C_MUTED))
+            cnt = tk.Label(row, text=str(count), font=self.F_SMALL,
+                           fg=self.C_MUTED, bg=bg)
+            cnt.pack(side="right", padx=6)
+            # Packed last, so a long name is what gets cut when space runs out
+            nm = tk.Label(row, text=name, anchor="w", bg=bg,
+                          font=self.F_BTN if sel else self.F_SMALL,
+                          fg=self.C_TEXT if sel else "#94a3b8")
+            nm.pack(side="left", fill="x", expand=True, padx=(8, 0))
+            for w in (row, cnt, nm):
+                w.bind("<Button-1>", lambda e, i=idx: self._set_view(i))
+
+        def wheel(e):
+            if inner.winfo_reqheight() > cv.winfo_height():
+                cv.yview_scroll(-1 if e.delta > 0 else 1, "units")
+
+        def bind_wheel(w):
+            w.bind("<MouseWheel>", wheel)
+            for ch in w.winfo_children():
+                bind_wheel(ch)
+        bind_wheel(cv)
+
+    def _page_view(self, idx):
+        """Custom page `idx` -> (groups by layer, typed designators that are
+        not in the drawing)."""
+        known = [d for gs in self.groups.values() for g in gs for d in g.designators]
+        found, missing = parse_refs(self.pages[idx]["refs"], known)
+        return page_groups(self.groups, found), missing
+
+    def _set_view(self, idx, force=False):
+        """Show the full drawing (None) or custom page `idx`."""
+        if idx == self.view and not force:
+            return
+        self.view = idx
+        self.page = 0
+        shown = self.groups if idx is None else self._page_view(idx)[0]
+        # A page with parts on one side only opens on that side
+        if shown and not shown.get(self.side):
+            self.side = "Top" if self.side == "Bottom" else "Bottom"
+            self._rebuild_side_btns()
+        self._refresh()
+
+    def _page_dialog(self, idx=None):
+        """Create a custom page, or edit page `idx`."""
+        page = (self.pages[idx] if idx is not None else
+                {"name": "Page %d" % (len(self.pages) + 1), "refs": ""})
+        known = [d for gs in self.groups.values() for g in gs for d in g.designators]
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Edit page" if idx is not None else "New page")
+        dlg.configure(bg=self.C_PANEL)
+        dlg.transient(self.root); dlg.grab_set()
+        dlg.resizable(False, False)
+
+        def label(text, row, pady):
+            tk.Label(dlg, text=text, bg=self.C_PANEL, fg=self.C_MUTED,
+                     font=self.F_SMALL).grid(row=row, column=0, sticky="w",
+                                             padx=14, pady=pady)
+
+        label("Name", 0, (14, 4))
+        e_name = tk.Entry(dlg, width=46, bg=self.C_CARD, fg=self.C_TEXT,
+                          insertbackground="white", relief="flat",
+                          font=self.F_SMALL)
+        e_name.insert(0, page["name"])
+        e_name.grid(row=1, column=0, sticky="we", padx=14, ipady=3)
+        label("Designators", 2, (12, 4))
+        txt = tk.Text(dlg, width=46, height=8, wrap="word", bg=self.C_CARD,
+                      fg=self.C_TEXT, insertbackground="white", relief="flat",
+                      font=self.F_SMALL, padx=6, pady=4)
+        txt.insert("1.0", page["refs"])
+        txt.grid(row=3, column=0, sticky="we", padx=14)
+        tk.Label(dlg, text="Commas, spaces or new lines between them. "
+                           "R7-R12 is a range.",
+                 bg=self.C_PANEL, fg=self.C_FAINT, font=("Segoe UI", 8)).grid(
+            row=4, column=0, sticky="w", padx=14, pady=(4, 0))
+        # Lines reserved up front, so the window does not resize while typing
+        status = tk.Label(dlg, bg=self.C_PANEL, fg=self.C_MUTED, font=self.F_SMALL,
+                          anchor="w")
+        status.grid(row=5, column=0, sticky="we", padx=14, pady=(10, 0))
+        warn = tk.Label(dlg, bg=self.C_PANEL, fg="#f87171", font=self.F_SMALL,
+                        anchor="nw", justify="left", wraplength=330, height=2)
+        warn.grid(row=6, column=0, sticky="we", padx=14)
+
+        def check(*_):
+            found, missing = parse_refs(txt.get("1.0", "end"), known)
+            groups = page_groups(self.groups, found)
+            per_side = {s: sum(g.quantity for g in groups.get(s, []))
+                        for s in ("Top", "Bottom")}
+            n = per_side["Top"] + per_side["Bottom"]
+            msg = "%d part%s" % (n, "" if n == 1 else "s")
+            if n:
+                msg += ": " + ", ".join("%d on %s" % (c, s.lower())
+                                        for s, c in per_side.items() if c)
+            status.configure(text=msg)
+            warn.configure(text="Not in the drawing: " + ", ".join(missing[:10]) +
+                                ("…" if len(missing) > 10 else "") if missing else "")
+            return n
+
+        result = {}
+
+        def save():
+            if not check():
+                warn.configure(text="None of these designators are in the drawing.")
+                return
+            entry = {"name": e_name.get().strip() or page["name"],
+                     "refs": txt.get("1.0", "end").strip()}
+            if idx is None:
+                self.pages.append(entry)
+                result["view"] = len(self.pages) - 1
+            else:
+                self.pages[idx] = entry
+                result["view"] = idx
+            dlg.destroy()
+
+        bar = tk.Frame(dlg, bg=self.C_PANEL)
+        bar.grid(row=7, column=0, sticky="e", padx=14, pady=(8, 14))
+        tk.Button(bar, text="Cancel", command=dlg.destroy, bg=self.C_CARD,
+                  fg=self.C_MUTED, relief="flat", padx=14,
+                  font=self.F_SMALL).pack(side="left", padx=(0, 8))
+        tk.Button(bar, text="Save", command=save, bg=self.C_GREEN, fg="white",
+                  relief="flat", padx=18, font=self.F_BTN).pack(side="left")
+
+        txt.bind("<KeyRelease>", check)
+        e_name.bind("<Return>", lambda e: txt.focus_set())
+        dlg.bind("<Control-Return>", lambda e: save())
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        check()
+        (txt if idx is None else e_name).focus_set()
+        dlg.wait_window()
+        if "view" in result:
+            self._mark_dirty()
+            self._set_view(result["view"], force=True)
+
+    def _delete_page(self, idx):
+        if not messagebox.askyesno("Delete page",
+                'Delete page "%s"?' % self.pages[idx]["name"]):
+            return
+        del self.pages[idx]
+        if self.view == idx:
+            self.view = None
+            self.page = 0
+        elif self.view is not None and self.view > idx:
+            self.view -= 1
+        self._mark_dirty()
+        self._refresh()
+
     def _set_sort(self, mode):
+        if mode != self.sort_mode:
+            self._mark_dirty()
         self.sort_mode = mode
         self.page = 0
         self._regroup()
@@ -2413,6 +3072,7 @@ class App:
         self.pnp = {d: copy.copy(c) for d, c in self.pnp_parsed.items()}
         if not self.pnp:
             self.groups = {"Top": [], "Bottom": []}
+            self.installation_groups = {}
             return
 
         # Build groups from BOM or auto
@@ -2420,6 +3080,19 @@ class App:
             self.groups = group_from_bom(self.bom_data, self.pnp)
         else:
             self.groups = group_auto(self.pnp)
+
+        drills = {'holes': self.archive_drill_evidence.get('holes', []) +
+                  self.drill_evidence.get('holes', []) + self.npth_evidence.get('holes', [])}
+        decisions = infer_geometry(self.pnp, self.geometry_evidence, drills)
+        self.geometry_warnings = list(dict.fromkeys(
+            self.geometry_evidence.get('warnings', []) + self.drill_evidence.get('warnings', []) +
+            self.npth_evidence.get('warnings', []) + self.archive_drill_evidence.get('warnings', [])))
+        for d, info in decisions.items():
+            comp = self.pnp[d]
+            comp.sort_size = info.get('sort_size')
+            comp.sort_source = info.get('size_source', '')
+            comp.geometry_stage = info.get('stage', '')
+            comp.geometry_review = '; '.join(info.get('review', []))
 
         # Apply sort based on mode
         if self.sort_mode == "bom":
@@ -2438,9 +3111,187 @@ class App:
                     key=lambda g: PREFIX_ORDER.get(
                         extract_prefix(g.designators[0]) if g.designators else "", 50))
 
+        apply_size_overrides(self.pnp, self.size_overrides)
+        self.installation_groups = assembly_groups(self.groups, self.pnp, self.mount_overrides,
+                                                  self.assembly_order, self.sort_mode)
+        self.groups = page_groups(self.installation_groups,
+                                 [d for gs in self.installation_groups.values()
+                                  for g in gs for d in g.designators if d not in self.excluded_refs])
         # DNI groups always go last on a side - same order as in the PDF
         for layer in self.groups:
             self.groups[layer].sort(key=lambda g: g.dni)
+
+    def _set_stage(self, stage):
+        self.stage = stage
+        self.page = 0
+        self._refresh()
+
+    def _assembly_dialog(self):
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Installation order — select parts to move or defer")
+        dlg.geometry("1200x700")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        tk.Label(dlg, text="THT = through-hole. Manual = late hand installation (including SMD). Both go after SMT.\n"
+                 "Exclude removes a part from the assembly list and PDF; Include restores it. Unknown sizes sort last.\n"
+                 "Paste area is an estimated placement area, not body size. Inferred / review results need checking.\n"
+                 "THT geometry detection needs Gerber outer copper + plated drill coordinates; it is not guaranteed.",
+                 justify="left").pack(anchor="w", padx=12, pady=10)
+        frame = ttk.Frame(dlg)
+        frame.pack(fill="both", expand=True, padx=12)
+        tree = ttk.Treeview(frame, columns=("side", "stage", "basis", "footprint", "size", "part"),
+                            show="tree headings", selectmode="extended")
+        tree.heading("#0", text="Ref")
+        tree.column("#0", width=80)
+        for key, title, width in (("side", "Side", 65), ("stage", "Stage", 85),
+                                  ("basis", "Mount source / review", 210),
+                                  ("footprint", "Footprint", 160), ("size", "Sort size mm / source", 215),
+                                  ("part", "Part", 220)):
+            tree.heading(key, text=title)
+            tree.column(key, width=width)
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        tree.pack(fill="both", expand=True)
+        overrides = dict(self.mount_overrides)
+        excluded = set(self.excluded_refs)
+        sizes = copy.deepcopy(self.size_overrides)
+        ordered = []
+        records = {}
+        for _, sheets in assembly_sections(self.installation_groups):
+            for side, _, gwc in sheets:
+                for g, _, _ in gwc:
+                    for d in g.designators:
+                        if d in records:
+                            continue
+                        c = self.pnp.get(d)
+                        records[d] = (side, g, c)
+                        ordered.append(d)
+
+        def refresh():
+            selected = tree.selection()
+            tree.delete(*tree.get_children())
+            for d in ordered:
+                side, g, c = records[d]
+                detected = component_stage(c, g)
+                dimensions = c.sort_size if c and c.sort_size else (c.w,c.h) if c else None
+                source = (c.sort_source or c.size_source) if c else 'unknown'
+                tree.insert("", "end", iid=d, text=d, values=(side,
+                    "Excluded" if d in excluded else overrides.get(d) or detected,
+                    "user override" if d in overrides else (c.mount_source + (" / " + c.geometry_review if c.geometry_review else "")) if c else "unconfirmed — review",
+                    c.footprint if c else "—",
+                    (f"{sizes[d][0]:g} × {sizes[d][1]:g} / manual" if d in sizes else
+                     f"{dimensions[0]:g} × {dimensions[1]:g} / {source}" if dimensions and source != "unknown" else
+                     "Unknown — set size"), g.comment))
+            tree.selection_set(selected)
+            if selected:
+                tree.see(selected[0])
+
+        def assign(value):
+            for d in tree.selection():
+                if value == "Auto":
+                    overrides.pop(d, None)
+                else:
+                    overrides[d] = value
+            refresh()
+
+        def include(value):
+            for d in tree.selection():
+                if value:
+                    excluded.discard(d)
+                else:
+                    excluded.add(d)
+            refresh()
+
+        size_bar = ttk.Frame(dlg)
+        size_bar.pack(fill="x", padx=12, pady=(10, 0))
+        ttk.Label(size_bar, text="Size for selected parts, mm: ").pack(side="left")
+        width = ttk.Entry(size_bar, width=8)
+        width.pack(side="left")
+        ttk.Label(size_bar, text=" × ").pack(side="left")
+        height = ttk.Entry(size_bar, width=8)
+        height.pack(side="left")
+
+        def set_size(auto=False):
+            selected = tree.selection()
+            if not selected:
+                return
+            if not auto:
+                size = valid_size_overrides({"value": [width.get().replace(",", "."), height.get().replace(",", ".")]})
+                if not size:
+                    messagebox.showerror("Size", "Enter two positive, finite dimensions in millimetres.", parent=dlg)
+                    return
+            for d in selected:
+                if auto:
+                    sizes.pop(d, None)
+                    c = records[d][2]
+                    if c:
+                        c = copy.copy(c)
+                        c._estimate_size()
+                        # Restore automatic geometry, not the applied manual size.
+                        inferred = infer_geometry(self.pnp, self.geometry_evidence,
+                            {'holes': self.archive_drill_evidence.get('holes', []) +
+                             self.drill_evidence.get('holes', []) + self.npth_evidence.get('holes', [])}).get(d, {})
+                        c.sort_size = inferred.get('sort_size')
+                        c.sort_source = inferred.get('size_source', '')
+                        side, g, _ = records[d]
+                        records[d] = (side, g, c)
+                else:
+                    sizes[d] = size["value"][:]
+            refresh()
+
+        ttk.Button(size_bar, text="Set size", command=set_size).pack(side="left", padx=4)
+        ttk.Button(size_bar, text="Auto size", command=lambda: set_size(True)).pack(side="left")
+        ttk.Button(size_bar, text="Geometry warnings…", command=lambda: messagebox.showinfo(
+            "Geometry evidence", "\n".join(self.geometry_warnings) if self.geometry_warnings else
+            "No file parsing warnings. Inferred matches are still estimates; review mounting and sizes.", parent=dlg)).pack(side="left", padx=4)
+        ttk.Button(size_bar, text="Exclude", command=lambda: include(False)).pack(side="right")
+        ttk.Button(size_bar, text="Include", command=lambda: include(True)).pack(side="right", padx=4)
+
+        moved = [False]
+        reset = [False]
+
+        def reset_order():
+            reset[0] = True
+            dlg.title("Installation order — automatic size order will be restored on Apply")
+
+        def move(delta):
+            selected = set(tree.selection())
+            indices = range(len(ordered)) if delta < 0 else range(len(ordered) - 1, -1, -1)
+            for i in indices:
+                j = i + delta
+                if ordered[i] in selected and 0 <= j < len(ordered) and ordered[j] not in selected:
+                    ordered[i], ordered[j] = ordered[j], ordered[i]
+                    moved[0] = True
+            refresh()
+
+        bar = ttk.Frame(dlg)
+        bar.pack(fill="x", padx=12, pady=12)
+        for label, value in (("Auto detect", "Auto"), ("SMT", "SMT"), ("THT", "THT"), ("Install manually", "Manual")):
+            ttk.Button(bar, text=label, command=lambda v=value: assign(v)).pack(side="left", padx=2)
+        ttk.Button(bar, text="↑ Earlier", command=lambda: move(-1)).pack(side="left", padx=2)
+        ttk.Button(bar, text="↓ Later", command=lambda: move(1)).pack(side="left", padx=2)
+
+        def save():
+            if (overrides != self.mount_overrides or moved[0] or reset[0] or
+                    excluded != self.excluded_refs or sizes != self.size_overrides):
+                self.mount_overrides = overrides
+                self.excluded_refs = excluded
+                self.size_overrides = sizes
+                if reset[0]:
+                    self.assembly_order = []
+                elif moved[0]:
+                    self.assembly_order = ordered
+                self._mark_dirty()
+                self._regroup()
+                self.page = 0
+                self._refresh()
+            dlg.destroy()
+
+        ttk.Button(bar, text="Apply", command=save).pack(side="right")
+        ttk.Button(bar, text="Cancel", command=dlg.destroy).pack(side="right", padx=4)
+        ttk.Button(dlg, text="Reset manual order to selected sort mode", command=reset_order).pack(pady=(0, 8))
+        refresh()
 
     def _open_custom_dialog(self):
         """Dialog for custom prefix ordering."""
@@ -2490,6 +3341,7 @@ class App:
         def apply():
             self.custom_order = [listbox.get(i).strip() for i in range(listbox.size())]
             self.sort_mode = "custom"
+            self._mark_dirty()
             self._regroup()
             self._refresh()
             dlg.destroy()
@@ -2572,27 +3424,32 @@ class App:
     def _build_legend(self):
         for w in self.right_panel.winfo_children(): w.destroy()
 
-        sg = self.groups.get(self.side, [])
-        tp = max(1, math.ceil(len(sg) / self.ROWS))
+        sg = self.shown.get(self.side, [])
+        tp = max(1, len(self.preview_sheets))
+        # On a custom page the legend is titled with the page, as a reminder
+        # that the board shows only part of the drawing
+        title = "Legend" if self.view is None else self.pages[self.view]["name"]
+        if len(title) > 16:
+            title = title[:15] + "…"
 
         hdr = tk.Frame(self.right_panel, bg=self.C_PANEL)
         hdr.pack(fill="x", padx=16, pady=(16, 4))
-        tk.Label(hdr, text="Legend", font=("Segoe UI", 12, "bold"),
-                fg=self.C_TEXT, bg=self.C_PANEL).pack(side="left")
-        tk.Label(hdr, text=f"  {len(sg)}", font=("Segoe UI", 11),
-                fg=self.C_MUTED, bg=self.C_PANEL).pack(side="left")
-
         nav = tk.Frame(hdr, bg=self.C_PANEL); nav.pack(side="right")
         self._rounded_btn(nav, "‹", self._prev,
             bg=self.C_CARD, fg=self.C_MUTED, hover=self.C_HOVER,
             font=self.F_BODY, padx=4, pady=3, radius=7,
             min_w=28, min_h=26).pack(side="left")
-        tk.Label(nav, text=f"{self.page+1} / {tp}", font=("Segoe UI", 9),
+        tk.Label(nav, text=self.preview_number, font=("Segoe UI", 9),
                 fg=self.C_MUTED, bg=self.C_PANEL).pack(side="left", padx=6)
         self._rounded_btn(nav, "›", self._next,
             bg=self.C_CARD, fg=self.C_MUTED, hover=self.C_HOVER,
             font=self.F_BODY, padx=4, pady=3, radius=7,
             min_w=28, min_h=26).pack(side="left")
+        # Packed after the page buttons, so a long title is what gets squeezed
+        tk.Label(hdr, text=title, font=("Segoe UI", 12, "bold"),
+                fg=self.C_TEXT, bg=self.C_PANEL).pack(side="left")
+        tk.Label(hdr, text=f"  {len(sg)}", font=("Segoe UI", 11),
+                fg=self.C_MUTED, bg=self.C_PANEL).pack(side="left")
 
         ch = tk.Frame(self.right_panel, bg=self.C_PANEL)
         ch.pack(fill="x", padx=16, pady=(10, 4))
@@ -2608,9 +3465,9 @@ class App:
                 anchor="e").grid(row=0, column=3)
 
         install_colors = self._install_colors()
-        start = self.page * self.ROWS
+        start = self.preview_start
         self.legend_rows = {}
-        for i, g in enumerate(sg[start:start+self.ROWS]):
+        for i, g in enumerate(self.preview_groups):
             ci = start + i
             color = DNI_COLOR if g.dni else install_colors.get(ci, PALETTE[0])
 
@@ -2676,7 +3533,7 @@ class App:
 
     def _set_focus(self, ci):
         """Focus the board on legend group `ci` of this side, or clear with None."""
-        sg = self.groups.get(self.side, [])
+        sg = self.shown.get(self.side, [])
         if ci is not None and ci >= len(sg):
             ci = None
         if not self.main_built or ci == self.focus_group:
@@ -2728,7 +3585,7 @@ class App:
     def _install_colors(self):
         """Colour for each non-DNI group on a side, by running index -
         the same formula as generate_pdf, so GUI and PDF colours match."""
-        sg = self.groups.get(self.side, [])
+        sg = self.shown.get(self.side, [])
         colors = {}
         k = 0
         for ci, g in enumerate(sg):
@@ -2763,17 +3620,33 @@ class App:
         if self.page > 0: self.page -= 1; self._refresh()
 
     def _next(self):
-        sg = self.groups.get(self.side, [])
-        if self.page < math.ceil(len(sg) / self.ROWS) - 1:
+        if self.page < len(self.preview_sheets) - 1:
             self.page += 1; self._refresh()
 
     def _refresh(self):
         if not self.main_built:
             return      # left for the file screen before the timer fired
         self.focus_group = None     # board.load() clears the board side of it
-        sg = self.groups.get(self.side, [])
-        start = self.page * self.ROWS
-        pg = sg[start:start+self.ROWS]
+        if self.view is not None and self.view >= len(self.pages):
+            self.view = None
+        if self.view is None:
+            self.shown, missing = self.groups, []
+        else:
+            self.shown, missing = self._page_view(self.view)
+        all_groups = self.shown
+        self.shown = {side: [g for g in gs if (g.stage == "SMT") == (self.stage == "SMT")]
+                      for side, gs in all_groups.items()}
+        section = next((sheets for stage, sheets in assembly_sections(all_groups)
+                        if stage == self.stage and any(s == self.side for s, _, _ in sheets)), [])
+        self.preview_sheets = [(i, sheet) for i, sheet in enumerate(section, 1) if sheet[0] == self.side]
+        self.page = min(self.page, max(0, len(self.preview_sheets) - 1))
+        self.preview_start = sum(len(sheet[2]) for _, sheet in self.preview_sheets[:self.page])
+        self.preview_groups = ([g for g, _, _ in self.preview_sheets[self.page][1][2]]
+                               if self.preview_sheets else [])
+        self.preview_number = (f"{self.preview_sheets[self.page][0]} / {len(section)}"
+                               if self.preview_sheets else "0 / 0")
+        sg = self.shown.get(self.side, [])
+        pg = self.preview_groups
         install_colors = self._install_colors()
         colors = {}
         for ci, g in enumerate(sg):
@@ -2782,20 +3655,29 @@ class App:
         active = set()
         for g in pg: active.update(g.designators)
         bounds = compute_bounds(self.pnp, self.board_layers)
-        self.board.load(list(self.pnp.values()), self.side, colors, active, bounds,
+        self.board.load([c for d, c in self.pnp.items() if d not in self.excluded_refs],
+                       self.side, colors, active, bounds,
                        board_layers=self.board_layers)
         self._build_left()
         self._build_legend()
         top = sum(1 for c in self.pnp.values() if c.layer == "Top")
         bot = sum(1 for c in self.pnp.values() if c.layer == "Bottom")
-        self.status.configure(text=f"{len(self.pnp)} comp (Top:{top} Bot:{bot}) · "
-            f"{len(sg)} groups · {self.side} · scroll=zoom drag=pan · "
-            f"click a legend row to focus, Esc to clear")
+        text = (f"{len(self.pnp)} comp (Top:{top} Bot:{bot}) · "
+                f"{len(sg)} groups · {self.side} · scroll=zoom drag=pan · "
+                f"click a legend row to focus, Esc to clear")
+        if self.geometry_warnings:
+            text += f" · {len(self.geometry_warnings)} geometry warning(s) — review in Edit installation"
+        if self.view is not None:
+            text = f"Page {self.pages[self.view]['name']} · " + text
+            if missing:
+                text += " · not in the drawing: " + ", ".join(missing)
+        self.status.configure(text=text)
 
     def _sniff_type(self, path):
         """Detect the type of an imported file from its extension and contents."""
         ext = os.path.splitext(path)[1].lower()
         if ext == ".zip": return "gerber"
+        if ext in (".drl", ".xln", ".exc", ".tap"): return "drill"
         if ext in (".dxf", ".dwg"): return "gerber"
         if ext in (".xlsx", ".xls"): return "bom"
         if ext == ".pos": return "pnp"
@@ -2803,6 +3685,8 @@ class App:
             head = _read_text(path)[:4000].lower()
         except Exception:
             head = ""
+        if re.search(r'(?m)^\s*m48\b', head):
+            return "npth" if re.search(r'type\s*=\s*non[_ -]?plated', head) else "drill"
         if (re.search(r'designator|(^|\W)ref(\W|$)', head)
                 and re.search(r'layer|side', head)
                 and re.search(r'center-x|mid x|pos ?x', head)):
@@ -2811,18 +3695,24 @@ class App:
 
     def _import_more(self):
         paths = filedialog.askopenfilenames(title="Import",
-            filetypes=[("All","*.txt *.csv *.pos *.xlsx *.xls *.zip *.dxf *.dwg"),
+            filetypes=[("All","*.txt *.csv *.pos *.xlsx *.xls *.zip *.dxf *.dwg *.drl *.xln *.exc *.tap"),
                        ("All","*.*")])
         for p in paths:
-            self._load_file_typed(self._sniff_type(p), p)
+            ftype = self._sniff_type(p)
+            if ftype in ('drill', 'npth'):
+                messagebox.showinfo('NC drill files',
+                    'Add plated and non-plated drill coordinate files to the Gerber ZIP, then load that archive.')
+                continue
+            self._load_file_typed(ftype, p)
         if self.main_built: self._refresh()
 
     # ── Export ────────────────────────────────────────────────────────
 
     def _ask_metadata(self):
-        """Drawing setup: sheet, scale and the ISO 7200 title block fields.
+        """Drawing setup: content, sheet, scale and the ISO 7200 title block.
 
-        Returns the metadata dict, or None when the dialog was cancelled.
+        Returns (metadata dict, custom page index or None for the full
+        drawing), or None when the dialog was cancelled.
         """
         dlg = tk.Toplevel(self.root)
         dlg.title("Drawing setup — ISO 5457 / ISO 7200")
@@ -2859,24 +3749,35 @@ class App:
             box.grid(row=row, column=1, sticky="w", padx=(0, 14), pady=4)
             return var
 
-        head("SHEET — ISO 5457", 0)
+        # Each custom page goes to a file of its own, so one is chosen here
+        head("CONTENT", 0)
+        tk.Label(dlg, text="Export", bg=self.C_PANEL, fg=self.C_MUTED,
+                 font=self.F_SMALL).grid(row=1, column=0, sticky="w",
+                                         padx=(14, 8), pady=4)
+        content = ttk.Combobox(dlg, state="readonly", width=31, font=self.F_SMALL,
+                               values=["Full drawing"] +
+                                      ["Page: " + p["name"] for p in self.pages])
+        content.current(0 if self.view is None else self.view + 1)
+        content.grid(row=1, column=1, sticky="w", padx=(0, 14), pady=4)
+
+        head("SHEET — ISO 5457", 2)
         v_fmt = combo("Format", "sheet_format",
-                      list(SHEET_SIZES.keys()), "A4", 1)
+                      list(SHEET_SIZES.keys()), "A4", 3)
         v_orient = combo("Orientation", "orientation",
-                         ["Landscape", "Portrait"], "Landscape", 2)
+                         ["Landscape", "Portrait"], "Landscape", 4)
         v_scale = combo("Scale", "scale_mode",
                         ["auto", "fit"] + ["%d:%d" % s for s in ISO_SCALES],
-                        "auto", 3)
+                        "auto", 5)
 
-        head("TITLE BLOCK — ISO 7200", 4)
-        e_title = entry("Title", "project", "Assembly", 5)
-        e_owner = entry("Legal owner", "owner", "", 6)
-        e_docno = entry("Identification no.", "doc_no", "", 7)
-        e_rev = entry("Revision index", "edition", "A", 8)
+        head("TITLE BLOCK — ISO 7200", 6)
+        e_title = entry("Title", "project", "Assembly", 7)
+        e_owner = entry("Legal owner", "owner", "", 8)
+        e_docno = entry("Identification no.", "doc_no", "", 9)
+        e_rev = entry("Revision index", "edition", "A", 10)
         e_date = entry("Date of issue", "date",
-                       datetime.date.today().isoformat(), 9)
-        e_creator = entry("Created by", "designer", "", 10)
-        e_appr = entry("Approved by", "approver", "", 11)
+                       datetime.date.today().isoformat(), 11)
+        e_creator = entry("Created by", "designer", "", 12)
+        e_appr = entry("Approved by", "approver", "", 13)
 
         # Fixed width and two reserved lines: the hint text changes length with
         # every selection, and without this the window would resize under the
@@ -2884,7 +3785,7 @@ class App:
         hint = tk.Label(dlg, bg=self.C_PANEL, fg=self.C_FAINT,
                         font=("Segoe UI", 8), justify="left", anchor="nw",
                         wraplength=self.HINT_W, width=1, height=2)
-        hint.grid(row=12, column=0, columnspan=2, sticky="we", padx=14,
+        hint.grid(row=14, column=0, columnspan=2, sticky="we", padx=14,
                   pady=(12, 0))
 
         def refresh_hint(*_):
@@ -2907,6 +3808,7 @@ class App:
         refresh_hint()
 
         out = {}
+        chosen = {}     # read before the dialog is destroyed
 
         def ok():
             out.update({
@@ -2921,10 +3823,12 @@ class App:
                 "designer": e_creator.get().strip(),
                 "approver": e_appr.get().strip(),
             })
+            pick = content.current()
+            chosen["view"] = None if pick <= 0 else pick - 1
             dlg.destroy()
 
         bar = tk.Frame(dlg, bg=self.C_PANEL)
-        bar.grid(row=13, column=0, columnspan=2, sticky="e", padx=14,
+        bar.grid(row=15, column=0, columnspan=2, sticky="e", padx=14,
                  pady=(8, 14))
         tk.Button(bar, text="Cancel", command=dlg.destroy, bg=self.C_CARD,
                   fg=self.C_MUTED, relief="flat", padx=14,
@@ -2940,17 +3844,25 @@ class App:
         dlg.wait_window()
         if not out:
             return None
+        if any(out.get(k) != self.meta.get(k) for k in PROJECT_META_KEYS):
+            self._mark_dirty()
         self.meta = out
-        return out
+        return out, chosen["view"]
 
     def _export_pdf(self):
         if not self.pnp:
             messagebox.showinfo("Info", "Load Pick & Place first"); return
         # Setup first: the file name is built from the title entered there
-        meta = self._ask_metadata()
-        if meta is None: return
-        name = re.sub(r'[\\/:*?"<>|]+', "_",
-                      "Assembly drawing for %s" % meta["project"]).strip(" .")
+        setup = self._ask_metadata()
+        if setup is None: return
+        meta, view = setup
+        name = "Assembly drawing for %s" % meta["project"]
+        if view is None:
+            groups, page_name = self.groups, ""
+        else:
+            groups, page_name = self._page_view(view)[0], self.pages[view]["name"]
+            name += " - " + page_name
+        name = re.sub(r'[\\/:*?"<>|]+', "_", name).strip(" .")
         # The .pdf is spelled out - a title like "Board_v4.1" would otherwise
         # have ".1" taken for its extension
         path = filedialog.asksaveasfilename(title="Export PDF",
@@ -2961,20 +3873,21 @@ class App:
         self.exporting = True
         self._set_btn_enabled(self.export_btn, False)
         self.status.configure(text="Generating PDF...")
-        threading.Thread(target=self._export_worker, args=(path, meta),
+        threading.Thread(target=self._export_worker,
+                         args=(path, meta, groups, page_name),
                          daemon=True).start()
 
-    def _export_worker(self, path, meta):
+    def _export_worker(self, path, meta, groups, page_name):
         def progress(pn, total, *args):
             self.root.after(0, lambda: self.status.configure(
                 text=f"PDF: page {pn}/{total}..."))
         try:
-            pages = generate_pdf(self.pnp, self.groups, path,
+            pages = generate_pdf({d: c for d, c in self.pnp.items() if d not in self.excluded_refs}, groups, path,
                 sheet_format=meta.get("sheet_format", "A4"),
                 landscape=meta.get("orientation", "Landscape") == "Landscape",
                 scale_mode=meta.get("scale_mode", "auto"),
                 board_layers=self.board_layers,
-                meta=meta,
+                meta=meta, page_name=page_name,
                 progress_callback=progress)
             self.root.after(0, self._export_done, path, pages, None)
         except Exception as e:

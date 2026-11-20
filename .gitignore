@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
+.uv-cache/
 venv/
 env/
 
@@ -33,6 +34,7 @@ dist/
 *.dwg
 *.dxf
 *_gerber.zip
+*.pcbasm
 
 # Editors / OS
 .vscode/
