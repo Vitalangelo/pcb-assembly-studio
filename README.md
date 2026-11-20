@@ -133,7 +133,25 @@ them.
 
 ## ⚠️ Limitations
 
-- Component sizes are estimated from description/package text. Load Gerbers for real pad geometry.
+**Automatic component recognition is not guaranteed.** Always review mounting
+types, component sizes and installation order before using an assembly drawing.
+Footprint names and descriptions can be incomplete or misleading.
+
+For **geometry-based THT recognition**, plated NC drill **coordinate files**
+(`.TXT`, `.DRL`, `.XLN`, etc.) are needed in addition to Gerber top/bottom copper
+and Pick & Place. Non-plated drill coordinates are also recommended to identify
+mechanical holes. Export all files from the same board revision with a common
+origin and consistent units. `.DRR` and `.LDP` reports do not replace the drill
+coordinates. Plated holes also include vias: a nearby hole or its diameter alone
+does not prove that a component is THT. **Even a complete set of files cannot
+guarantee correct automatic classification.** Ambiguous results need manual review.
+
+Drill-based recognition, inferred placement-area sorting and reversible component
+exclusions are currently implemented in the local development version; they are
+not yet included in the source or executable published here. The published
+version still relies on description/package heuristics for component recognition.
+
+- Component body sizes are estimates from description/package text. Gerber pad geometry is not a measurement of the component body or height.
 - Pin-1 markers come from Pick & Place rotation. Unusual library footprint orientation can put the marker in the wrong corner — check against your design.
 - DWG needs ODA File Converter. Export DXF from Altium instead, or use a Gerber ZIP.
 
