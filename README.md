@@ -13,16 +13,12 @@ found by looking instead of reading designators.*
 
 ---
 
-## 📥 Download
-
-**[PCBAssemblyStudio.exe](https://github.com/Vitalangelo/pcb-assembly-studio/releases/latest)** — one file, ~44 MB, double-click. No Python needed.
-
-The current source version is **v1.4.1**. A new executable has not been built for
-this version; use **Run from source** below to get the latest features.
-
-> Not code-signed, so Windows shows a warning on first run: **More info** → **Run anyway**.
-
 ## 🚀 Run from source
+
+**Source distribution only for now; Python is required.** Standalone Windows
+executables are not currently offered: unsigned builds can be blocked by Windows
+Smart App Control. Code signing and a supported binary distribution channel are
+still pending. Do not disable Windows protection to run this application.
 
 1. Install [Python 3.10+](https://www.python.org/downloads/) — tick **"Add Python to PATH"**
 2. Green **Code** button above → **Download ZIP** → right-click the ZIP → **Properties** → tick **Unblock** → unzip
@@ -41,8 +37,6 @@ python pcb_assembly_studio.py
 
 Optional extras: `openpyxl` for `.xlsx` BOMs, `ezdxf` for DXF, `tkinterdnd2` for
 drag-and-drop.
-
-Want your own `.exe`? Double-click `build_exe.bat` → `dist\PCBAssemblyStudio.exe`.
 
 ---
 
