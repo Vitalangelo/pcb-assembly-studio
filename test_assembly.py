@@ -17,6 +17,63 @@ def group(*refs, tech="", dni=False):
 
 
 class AssemblyTests(unittest.TestCase):
+    def test_partial_paste_evidence_does_not_split_identical_bom_parts(self):
+        pnp = {d: part(d, 'C0603') for d in ('C19', 'C26', 'C28', 'C54')}
+        pnp['C26'].sort_size = (2.1, 0.8)
+        pnp['C28'].sort_size = (2.1, 0.8)
+        pnp['C54'].sort_size = (2.1001, 0.8)
+        gs = app.assembly_groups({'Top': [group(*pnp)]}, pnp)
+        self.assertEqual(len(gs['Top']), 1)
+        self.assertEqual(gs['Top'][0].designators, list(pnp))
+        self.assertEqual(gs['Top'][0].quantity, 4)
+
+    def test_distinct_footprints_still_split_even_with_same_body_size(self):
+        pnp = {'C1': part('C1', 'custom-A'), 'C2': part('C2', 'custom-B')}
+        gs = app.assembly_groups({'Top': [group('C1', 'C2')]}, pnp)
+        self.assertEqual(len(gs['Top']), 2)
+
+    def test_manual_size_and_installation_overrides_still_split(self):
+        pnp = {d: part(d, 'C0603') for d in ('C1', 'C2', 'C3')}
+        app.apply_size_overrides(pnp, {'C2': [4, 3]})
+        gs = app.assembly_groups({'Top': [group(*pnp)]}, pnp, {'C3': 'Manual'})
+        self.assertEqual(len(gs['Top']), 3)
+        self.assertEqual(next(g for g in gs['Top'] if 'C3' in g.designators).stage, 'Manual')
+
+    def test_legend_uses_pdf_part_number_and_technical_data(self):
+        g = group('C1')
+        g.comment = ''
+        g.description = 'Old preview description'
+        g.part_no, g.tech = 'PART-123', 'CAP MLCC 0.1uF 50V 10% 0603'
+        self.assertEqual(app.legend_fields(g), (g.part_no, g.tech))
+        g.part_no, g.tech = '', ''
+        g.comment = 'Fallback value'
+        self.assertEqual(app.legend_fields(g), ('Fallback value', g.description))
+
+    def test_native_legend_widgets_show_part_number_and_full_technical_tooltip(self):
+        try:
+            root = app.tk.Tk()
+        except app.tk.TclError as exc:
+            self.skipTest(str(exc))
+        root.withdraw()
+        self.addCleanup(root.destroy)
+        a = app.App.__new__(app.App)
+        a.root, a.board = root, Mock()
+        a.right_panel = app.tk.Frame(root, width=320, height=600)
+        g = group('C1', 'C2')
+        g.comment, g.part_no, g.tech = '', 'PART-123', 'CAP MLCC 0.1uF 50V 10% 0603'
+        a.side, a.view, a.page = 'Top', None, 0
+        a.shown, a.preview_groups = {'Top': [g]}, [g]
+        a.preview_sheets, a.preview_number, a.preview_start = [None], '1 / 1', 0
+        a._build_legend()
+        labels = [w for w in a.legend_rows[0].winfo_children() if isinstance(w, app.tk.Label)]
+        self.assertIn(g.part_no, [w.cget('text') for w in labels])
+        technical = next(w for w in labels if w.cget('text') == g.tech)
+        self.assertEqual(int(technical.cget('height')), 2)
+        # Board highlighting must not overwrite the full-text tooltip bindings.
+        self.assertIn('show', technical.bind('<Enter>'))
+        self.assertIn('<lambda>', technical.bind('<Enter>'))
+        root.update_idletasks()
+
     def test_long_technical_description_is_preserved(self):
         description = 'MLCC 22uF 25V X5R 0805, CAP MLCC 22uF 25V 20% 0805, Cap MLCC - SMD/SMT 22uF 25VDC 20% 0805 X5R'
         row = app._bom_row_to_result('GRM21BR61E226ME44K', description, '', 'C1', 'Top')
@@ -24,19 +81,104 @@ class AssemblyTests(unittest.TestCase):
         row = app._bom_row_to_result('part', '  MLCC\n 22uF\t25V  ', '', 'C1', 'Top')
         self.assertEqual(row['tech'], 'MLCC 22uF 25V')
 
-    def test_technical_data_shows_fitting_prefix_without_shrinking(self):
+    def test_technical_data_wraps_and_shrinks_inside_cell(self):
         sheet = app.Sheet('A4', True)
         try:
             g = group('C1')
             g.tech = 'MLCC 22uF 25V X5R 0805, CAP MLCC 22uF 25V 20% 0805, ' * 10
             app.draw_parts_list(sheet, [(g, app.PALETTE[0], 1)], sheet.lay['rowh'])
-            label = next(t for t in sheet.ov.texts if t.get_text().startswith('MLCC'))
-            self.assertTrue(label.get_text().endswith('…'))
-            self.assertTrue(g.tech.startswith(label.get_text()[:-1]))
-            self.assertAlmostEqual(label.get_fontsize(), app.mm_font(app.H_SMALL))
-            self.assertLessEqual(sheet.measure(label.get_text(), app.H_SMALL), 43.2)
+            x = sheet.lay['parts_list'][0] + app.PARTS_LIST_COLS[3] + 1.4
+            header_y = sheet.lay['parts_list'][1] + sheet.lay['rowh'] * app.ROWS_PER_PAGE
+            labels = [t for t in sheet.ov.texts if abs(t.get_position()[0]-x) < 1e-6
+                      and t.get_position()[1] < header_y]
+            self.assertGreater(len(labels), 1)
+            self.assertTrue(labels[-1].get_text().endswith('…'))
+            self.assertLess(labels[0].get_fontsize(), app.mm_font(app.H_SMALL))
+            for label in labels:
+                h = label.get_fontsize() / app.mm_font(1)
+                self.assertLessEqual(sheet.measure(label.get_text(), h), 43.2 + 1e-6)
         finally:
             app.plt.close(sheet.fig)
+
+    def test_pdf_column_width_transfer(self):
+        cols = app.PARTS_LIST_COLS
+        self.assertAlmostEqual(cols[2]-cols[1], 58 * 2/3)
+        self.assertAlmostEqual(cols[6]-cols[5], 14 + 58/3)
+        self.assertAlmostEqual(cols[3]-cols[2], 38)
+        self.assertAlmostEqual(cols[4]-cols[3], 46)
+
+    def test_cell_fitting_wraps_and_reduces_before_truncating(self):
+        measure = lambda text, font: len(text) * font * 0.5
+        text = 'one two three four five'
+        lines, font = app.fit_cell_text(text, 12, 4, measure)
+        self.assertEqual(' '.join(lines), text)
+        self.assertLess(font, app.H_SMALL)
+        self.assertTrue(all(measure(line, font) <= 12 for line in lines))
+        self.assertLessEqual(len(lines) * font * 1.25, 4)
+        lines, font = app.fit_cell_text('superlongwordwithoutspaces' * 10, 12, 4, measure)
+        self.assertTrue(lines[-1].endswith('…'))
+        self.assertTrue(all(measure(line, font) <= 12 for line in lines))
+
+    def test_remarks_split_only_parts_with_different_notes_and_survive_page_filter(self):
+        pnp = {d: part(d, 'C0603') for d in ('C1','C2','C3')}
+        notes = {'C1': 'Fit after test', 'C2': 'Fit after test', 'C3': 'Do not bend'}
+        gs = app.assembly_groups({'Top':[group(*pnp)]}, pnp, remarks=notes)
+        self.assertEqual(len(gs['Top']), 2)
+        g = next(g for g in gs['Top'] if 'C1' in g.designators)
+        self.assertEqual(g.designators, ['C1','C2'])
+        self.assertEqual(g.remarks, 'Fit after test')
+        filtered = app.page_groups(gs, ['C2'])
+        self.assertEqual(filtered['Top'][0].remarks, 'Fit after test')
+        self.assertEqual(app.valid_component_remarks({'C1':' hi\n there ','C2':'','bad':None}),
+                         {'C1':'hi\n there'})
+
+    def test_installation_editor_edits_remarks_and_cancel_discards_them(self):
+        try:
+            root = app.tk.Tk()
+        except app.tk.TclError as exc:
+            self.skipTest(str(exc))
+        root.withdraw()
+        self.addCleanup(root.destroy)
+        a = app.App.__new__(app.App)
+        a.root = root
+        a.main_built = False
+        a._reset_project()
+        a.pnp_parsed = {d:part(d,'C0603') for d in ('C1','C2')}
+        a._regroup()
+
+        def descendants(widget):
+            return [child for w in widget.winfo_children() for child in [w]+descendants(w)]
+
+        def button(widget, text):
+            return next(w for w in descendants(widget) if isinstance(w, app.ttk.Button) and w.cget('text') == text)
+
+        def edit():
+            a._assembly_dialog()
+            dialog = next(w for w in root.winfo_children() if isinstance(w, app.tk.Toplevel))
+            tree = next(w for w in descendants(dialog) if isinstance(w, app.ttk.Treeview))
+            self.assertIn('part_no', tree['columns'])
+            tree.selection_set('C1')
+            button(dialog, 'Edit remarks…').invoke()
+            editor = next(w for w in dialog.winfo_children() if isinstance(w, app.tk.Toplevel))
+            entry = next(w for w in descendants(editor) if isinstance(w, app.tk.Text))
+            entry.insert('1.0', 'Fit after test\nCheck polarity')
+            button(editor, 'Save remark').invoke()
+            self.assertEqual(tree.set('C1','remarks'), 'Fit after test\nCheck polarity')
+            return dialog
+
+        dialog = edit()
+        button(dialog, 'Cancel').invoke()
+        self.assertEqual(a.component_remarks, {})
+        dialog = edit()
+        button(dialog, 'Apply').invoke()
+        self.assertEqual(a.component_remarks, {'C1':'Fit after test\nCheck polarity'})
+        self.assertEqual(next(g for g in a.groups['Bottom'] if 'C1' in g.designators).remarks,
+                         'Fit after test\nCheck polarity')
+        with tempfile.TemporaryDirectory() as folder:
+            a.project_path = os.path.join(folder,'notes.pcbasm')
+            self.assertTrue(a._save_project())
+            saved = app.read_project(a.project_path)
+            self.assertEqual(app.valid_component_remarks(saved['component_remarks']), a.component_remarks)
 
     def test_export_publishes_finished_file_and_sends_progress(self):
         a = app.App.__new__(app.App)

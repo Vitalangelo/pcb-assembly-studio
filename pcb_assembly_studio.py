@@ -21,7 +21,7 @@ import tempfile
 import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, replace
 from typing import Dict, List
 from assembly_geometry import load_gerber_evidence, load_drill_evidence, infer_geometry
@@ -61,7 +61,7 @@ PREFIX_ORDER = {
     "F": 30, "J": 31, "X": 32, "P": 33, "S": 40, "SW": 40,
 }
 
-APP_VERSION = "1.4.3"
+APP_VERSION = "1.5"
 
 # ---------------------------------------------------------------------------
 #  ISO drawing sheet - geometry, line widths, lettering
@@ -86,6 +86,9 @@ GRID_FIELD_LEN = 50.0       # ISO 5457:1999 4.4 - corner fields take the remaind
 ZONE_LETTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ"
 
 TITLE_BLOCK_W = 180.0       # ISO 7200:2004 clause 6 - fills the A4 drawing space
+_REF_WIDTH = 58.0 * 2.0 / 3.0
+PARTS_LIST_COLS = (0.0, 12.0, 12.0 + _REF_WIDTH, 50.0 + _REF_WIDTH,
+                   96.0 + _REF_WIDTH, 108.0 + _REF_WIDTH, TITLE_BLOCK_W)
 TITLE_BLOCK_H = 36.0
 CAPTION_H = 7.0             # strip above the view for its caption and scale
 
@@ -370,6 +373,7 @@ class ComponentGroup:
     part_no: str = ""
     tech: str = ""
     stage: str = "SMT"
+    remarks: str = ""
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1218,7 +1222,7 @@ def page_groups(groups_by_layer, designators):
 # ═══════════════════════════════════════════════════════════════════════
 
 PROJECT_EXT = ".pcbasm"
-PROJECT_FORMAT = 4
+PROJECT_FORMAT = 5
 # Title block and sheet fields a project remembers. The date of issue is left
 # out on purpose: it belongs to an issue of the drawing, not to the project.
 PROJECT_META_KEYS = ("project", "owner", "doc_no", "edition", "designer",
@@ -1435,6 +1439,60 @@ def _wrap_mm(text, max_mm, h_mm, max_lines=2, sep=" "):
     return [ln if len(ln) <= budget else ln[:budget - 1] + "…" for ln in lines]
 
 
+def fit_cell_text(text, width, height, measure, h=H_SMALL, min_h=1.6):
+    """Measured word wrapping, then smaller lettering, then a marked truncation."""
+    text = str(text or '').strip().replace('\r\n', '\n').replace('\r', '\n')
+    if not text:
+        return [], h
+    tokens = re.findall(r'[^\S\n]*\n|\S+', text)
+    min_h = min(h, min_h)
+
+    def wrap(font, limit):
+        words, lines, current = deque(tokens), [], ''
+        while words:
+            word = words.popleft()
+            if '\n' in word:
+                lines.append(current)
+                current = ''
+            else:
+                candidate = current + (' ' if current else '') + word
+                if measure(candidate, font) <= width:
+                    current = candidate
+                    continue
+                if current:
+                    lines.append(current)
+                    current = ''
+                    words.appendleft(word)
+                else:
+                    lo, hi = 0, len(word)
+                    while lo < hi:
+                        mid = (lo + hi + 1) // 2
+                        if measure(word[:mid], font) <= width:
+                            lo = mid
+                        else:
+                            hi = mid - 1
+                    take = max(1, lo)
+                    lines.append(word[:take])
+                    if word[take:]:
+                        words.appendleft(word[take:])
+            if len(lines) >= limit and words:
+                return lines, False
+        if current:
+            lines.append(current)
+        return lines[:limit], len(lines) <= limit
+
+    for font in dict.fromkeys((h, max(min_h, h * 0.85), min_h)):
+        limit = max(1, int((height + 1e-9) / (font * 1.25)))
+        lines, fits = wrap(font, limit)
+        if fits:
+            return lines, font
+    last = lines[-1].rstrip()
+    while last and measure(last + '…', font) > width:
+        last = last[:-1].rstrip()
+    lines[-1] = last + '…'
+    return lines, font
+
+
 def grid_edges(centre, lo, hi):
     """Grid reference field boundaries between `lo` and `hi`.
 
@@ -1598,6 +1656,15 @@ class Sheet:
             w = self.measure(s, h, weight)
         return self.text(x, y, s, h=h, **kw)
 
+    def cell_text(self, x, y, text, width, height, h=H_SMALL, **kw):
+        """Fit text inside the specified cell, centered vertically."""
+        weight = kw.get('fontweight', 'normal')
+        lines, font = fit_cell_text(text, width, height,
+            lambda value, size: self.measure(value, size, weight), h=h)
+        pitch = font * 1.25
+        return [self.text(x, y + (len(lines)-1)*pitch/2 - i*pitch, line, h=font, **kw)
+                for i, line in enumerate(lines)]
+
     def caption(self, x, y, s):
         """ISO 7200 style field caption: small, top-left inside its cell."""
         return self.text(x + 1.2, y - 1.4, s, h=H_MICRO, va="top", color="#555")
@@ -1716,7 +1783,7 @@ def draw_parts_list(sheet, gwc, rowh):
     s = sheet
     x, y = s.lay["parts_list"]
     W = TITLE_BLOCK_W
-    cols = [0.0, 12.0, 70.0, 108.0, 154.0, 166.0, W]   # column boundaries
+    cols = PARTS_LIST_COLS
     # The grid is always full height. Pages with fewer groups leave blank rows,
     # the way a preprinted list does, so every sheet has the same geometry.
     total_h = rowh * (ROWS_PER_PAGE + 1)
@@ -1749,20 +1816,16 @@ def draw_parts_list(sheet, gwc, rowh):
             s.text(x + cols[1] / 2.0, mid, str(num), h=H_MICRO, ha="center",
                    fontweight="bold", zorder=5)
         w_ref = cols[2] - cols[1] - 2.8
-        refs = _wrap_mm(", ".join(group.designators), w_ref, H_MICRO,
-                        max_lines=2 if rowh >= 6.0 else 1, sep=", ")
-        lead = (len(refs) - 1) / 2.0 * H_MICRO * 1.5
-        for k, ln in enumerate(refs):
-            s.ftext(x + cols[1] + 1.4, mid + lead - k * H_MICRO * 1.5, ln,
-                    w_ref, h=H_MICRO)
-        s.ftext(x + cols[2] + 1.4, mid, group.part_no or group.comment,
-                cols[3] - cols[2] - 2.8, h=H_SMALL)
-        s.ftext(x + cols[3] + 1.4, mid, group.tech,
-                cols[4] - cols[3] - 2.8, h=H_SMALL, min_ratio=1.0)
+        s.cell_text(x + cols[1] + 1.4, mid, ", ".join(group.designators),
+                    w_ref, rowh-0.8, h=H_MICRO)
+        s.cell_text(x + cols[2] + 1.4, mid, group.part_no or group.comment,
+                    cols[3] - cols[2] - 2.8, rowh-0.8)
+        s.cell_text(x + cols[3] + 1.4, mid, group.tech,
+                    cols[4] - cols[3] - 2.8, rowh-0.8)
         s.text(x + (cols[4] + cols[5]) / 2.0, mid, str(group.quantity),
                h=H_SMALL, ha="center")
-        note = STR["dni_short"] if group.dni else group.note
-        s.ftext(x + cols[5] + 1.4, mid, note, W - cols[5] - 2.8, h=H_MICRO,
+        note = '\n'.join(value for value in (STR["dni_short"] if group.dni else group.note, group.remarks) if value)
+        s.cell_text(x + cols[5] + 1.4, mid, note, W - cols[5] - 2.8, rowh-0.8, h=H_MICRO,
                 color="#b00020" if group.dni else "#333")
 
 
@@ -1901,7 +1964,13 @@ def component_stage(comp, group):
     return result("SMT", "unconfirmed — review")
 
 
-def assembly_groups(groups, pnp, overrides=None, order=None, sort_mode="standard", excluded=None):
+def valid_component_remarks(data):
+    if not isinstance(data, dict):
+        return {}
+    return {str(d): text.strip() for d, text in data.items() if isinstance(text, str) and text.strip()}
+
+
+def assembly_groups(groups, pnp, overrides=None, order=None, sort_mode="standard", excluded=None, remarks=None):
     """Split BOM rows by size and installation stage, preserving board side."""
     overrides = overrides or {}
     excluded = set(excluded or [])
@@ -1918,11 +1987,15 @@ def assembly_groups(groups, pnp, overrides=None, order=None, sort_mode="standard
                 stage = overrides.get(d) or component_stage(c, g)
                 if stage not in ("SMT", "THT", "Manual"):
                     stage = component_stage(c, g)
-                size = tuple(round(v, 4) for v in (c.sort_size or (c.w,c.h))) if c else (float("inf"), float("inf"))
+                # Paste envelopes are estimates for sorting, not component identity.
+                # Missing/partial Gerber evidence must not split identical BOM parts.
+                size = tuple(round(v, 4) for v in (c.w,c.h)) if c else (None, None)
+                footprint = c.footprint.strip().casefold() if c else ''
                 # An explicitly ordered part can be moved independently of its BOM row.
-                key = (stage, size)
+                remark = (remarks or {}).get(d, g.remarks)
+                key = (stage, footprint, size, remark)
                 buckets.setdefault(key, []).append(d)
-            for (stage, size), ds in buckets.items():
+            for (stage, footprint, size, remark), ds in buckets.items():
                 if ranks:
                     ds.sort(key=lambda d: ranks.get(d, len(ranks)))
                 runs = []
@@ -1932,7 +2005,7 @@ def assembly_groups(groups, pnp, overrides=None, order=None, sort_mode="standard
                         runs.append([])
                     runs[-1].append(d)
                 for run in runs:
-                    split.append(replace(g, designators=run, quantity=len(run), stage=stage))
+                    split.append(replace(g, designators=run, quantity=len(run), stage=stage, remarks=remark))
         if sort_mode == "standard":
             def size_key(g):
                 cs = [pnp[d] for d in g.designators if d in pnp]
@@ -1946,6 +2019,11 @@ def assembly_groups(groups, pnp, overrides=None, order=None, sort_mode="standard
         split.sort(key=lambda g: g.dni)
         result[side] = split
     return result
+
+
+def legend_fields(group):
+    """Use the same source fields as the PDF's part-number and technical cells."""
+    return group.part_no or group.comment or "—", group.tech or group.description or ""
 
 
 def assembly_sections(groups):
@@ -2352,6 +2430,7 @@ class App:
         self.assembly_order = []
         self.excluded_refs = set()
         self.size_overrides = {}
+        self.component_remarks = {}
         self.installation_groups = {}
         self.geometry_evidence = {}
         self.archive_drill_evidence = {}
@@ -2624,6 +2703,7 @@ class App:
             "assembly_order": self.assembly_order,
             "excluded_refs": sorted(self.excluded_refs),
             "size_overrides": self.size_overrides,
+            "component_remarks": self.component_remarks,
         }
         try:
             write_project(path, data)
@@ -2690,6 +2770,7 @@ class App:
         self.assembly_order = list(dict.fromkeys(str(d) for d in data.get("assembly_order") or []))
         self.excluded_refs = set(str(d) for d in data.get("excluded_refs") or [])
         self.size_overrides = valid_size_overrides(data.get("size_overrides"))
+        self.component_remarks = valid_component_remarks(data.get('component_remarks'))
         self.pages = [{"name": str(p.get("name", "")), "refs": str(p.get("refs", ""))}
                       for p in data.get("pages") or []]
         relocated = False
@@ -3116,7 +3197,7 @@ class App:
 
         apply_size_overrides(self.pnp, self.size_overrides)
         self.installation_groups = assembly_groups(self.groups, self.pnp, self.mount_overrides,
-                                                  self.assembly_order, self.sort_mode)
+                                                  self.assembly_order, self.sort_mode, remarks=self.component_remarks)
         self.groups = page_groups(self.installation_groups,
                                  [d for gs in self.installation_groups.values()
                                   for g in gs for d in g.designators if d not in self.excluded_refs])
@@ -3142,23 +3223,27 @@ class App:
                  justify="left").pack(anchor="w", padx=12, pady=10)
         frame = ttk.Frame(dlg)
         frame.pack(fill="both", expand=True, padx=12)
-        tree = ttk.Treeview(frame, columns=("side", "stage", "basis", "footprint", "size", "part"),
+        tree = ttk.Treeview(frame, columns=("side", "stage", "part_no", "technical", "remarks", "footprint", "size", "basis"),
                             show="tree headings", selectmode="extended")
         tree.heading("#0", text="Ref")
-        tree.column("#0", width=80)
+        tree.column("#0", width=70, stretch=False)
         for key, title, width in (("side", "Side", 65), ("stage", "Stage", 85),
                                   ("basis", "Mount source / review", 210),
                                   ("footprint", "Footprint", 160), ("size", "Sort size mm / source", 215),
-                                  ("part", "Part", 220)):
+                                  ("part_no", "Part number", 190),
+                                  ("technical", "Technical data", 220), ("remarks", "Remarks (double-click to edit)", 240)):
             tree.heading(key, text=title)
-            tree.column(key, width=width)
+            tree.column(key, width=width, minwidth=60, stretch=False)
         scroll = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
-        tree.configure(yscrollcommand=scroll.set)
+        horizontal = ttk.Scrollbar(frame, orient='horizontal', command=tree.xview)
+        tree.configure(yscrollcommand=scroll.set, xscrollcommand=horizontal.set)
         scroll.pack(side="right", fill="y")
+        horizontal.pack(side='bottom', fill='x')
         tree.pack(fill="both", expand=True)
         overrides = dict(self.mount_overrides)
         excluded = set(self.excluded_refs)
         sizes = copy.deepcopy(self.size_overrides)
+        remarks = dict(self.component_remarks)
         ordered = []
         records = {}
         for _, sheets in assembly_sections(self.installation_groups):
@@ -3179,13 +3264,15 @@ class App:
                 detected = component_stage(c, g)
                 dimensions = c.sort_size if c and c.sort_size else (c.w,c.h) if c else None
                 source = (c.sort_source or c.size_source) if c else 'unknown'
-                tree.insert("", "end", iid=d, text=d, values=(side,
-                    "Excluded" if d in excluded else overrides.get(d) or detected,
-                    "user override" if d in overrides else (c.mount_source + (" / " + c.geometry_review if c.geometry_review else "")) if c else "unconfirmed — review",
-                    c.footprint if c else "—",
-                    (f"{sizes[d][0]:g} × {sizes[d][1]:g} / manual" if d in sizes else
+                mount = "Excluded" if d in excluded else overrides.get(d) or detected
+                basis = ("user override" if d in overrides else
+                         (c.mount_source + (" / " + c.geometry_review if c.geometry_review else "")) if c else "unconfirmed — review")
+                size_text = (f"{sizes[d][0]:g} × {sizes[d][1]:g} / manual" if d in sizes else
                      f"{dimensions[0]:g} × {dimensions[1]:g} / {source}" if dimensions and source != "unknown" else
-                     "Unknown — set size"), g.comment))
+                     "Unknown — set size")
+                tree.insert("", "end", iid=d, text=d, values=(side, mount,
+                    legend_fields(g)[0], legend_fields(g)[1], remarks.get(d, ''),
+                    c.footprint if c else "—", size_text, basis))
             tree.selection_set(selected)
             if selected:
                 tree.see(selected[0])
@@ -3205,6 +3292,65 @@ class App:
                 else:
                     excluded.add(d)
             refresh()
+
+        def clear_remarks():
+            for d in tree.selection():
+                remarks.pop(d, None)
+            refresh()
+
+        def edit_remarks():
+            selected = tree.selection()
+            if not selected:
+                return
+            editor = tk.Toplevel(dlg)
+            editor.title('Remarks — ' + ', '.join(selected[:4]) + ('…' if len(selected) > 4 else ''))
+            editor.transient(dlg)
+            ttk.Label(editor, text='Remark for selected components (line breaks allowed):').pack(anchor='w', padx=14, pady=(12, 6))
+            entry = tk.Text(editor, width=64, height=6, wrap='word', font=self.F_BODY)
+            entry.pack(fill='both', expand=True, padx=14)
+            values = {remarks.get(d, '') for d in selected}
+            if len(values) == 1:
+                entry.insert('1.0', values.pop())
+            else:
+                ttk.Label(editor, text='Selected components have different remarks. Saving replaces all selected remarks.').pack(padx=14, pady=6)
+
+            def close():
+                editor.destroy()
+                dlg.grab_set()
+
+            def accept():
+                value = entry.get('1.0', 'end-1c').strip()
+                for d in selected:
+                    if value:
+                        remarks[d] = value
+                    else:
+                        remarks.pop(d, None)
+                close()
+                refresh()
+
+            buttons = ttk.Frame(editor)
+            buttons.pack(fill='x', padx=14, pady=12)
+            ttk.Button(buttons, text='Save remark', command=accept).pack(side='right')
+            ttk.Button(buttons, text='Cancel', command=close).pack(side='right', padx=6)
+            editor.protocol('WM_DELETE_WINDOW', close)
+            editor.bind('<Control-Return>', lambda e: accept())
+            editor.bind('<Escape>', lambda e: close())
+            editor.grab_set()
+            entry.focus_set()
+
+        def edit_remark_cell(event):
+            if tree.identify_column(event.x) == '#' + str(tree['columns'].index('remarks') + 1):
+                ref = tree.identify_row(event.y)
+                if ref:
+                    tree.selection_set(ref)
+                    edit_remarks()
+
+        tree.bind('<Double-1>', edit_remark_cell)
+        note_bar = ttk.Frame(dlg)
+        note_bar.pack(fill='x', padx=12, pady=(6, 0))
+        ttk.Button(note_bar, text='Edit remarks…', command=edit_remarks).pack(side='left')
+        ttk.Button(note_bar, text='Clear remarks', command=clear_remarks).pack(side='left', padx=6)
+        ttk.Label(note_bar, text='Select parts or double-click their Remarks cell. Changes are saved with Apply.').pack(side='left')
 
         size_bar = ttk.Frame(dlg)
         size_bar.pack(fill="x", padx=12, pady=(10, 0))
@@ -3277,10 +3423,11 @@ class App:
 
         def save():
             if (overrides != self.mount_overrides or moved[0] or reset[0] or
-                    excluded != self.excluded_refs or sizes != self.size_overrides):
+                    excluded != self.excluded_refs or sizes != self.size_overrides or remarks != self.component_remarks):
                 self.mount_overrides = overrides
                 self.excluded_refs = excluded
                 self.size_overrides = sizes
+                self.component_remarks = remarks
                 if reset[0]:
                     self.assembly_order = []
                 elif moved[0]:
@@ -3458,14 +3605,11 @@ class App:
         ch.pack(fill="x", padx=16, pady=(10, 4))
         ch.columnconfigure(1, weight=1)
         tk.Label(ch, text="", width=2, bg=self.C_PANEL).grid(row=0, column=0)
-        tk.Label(ch, text="PART", font=("Segoe UI", 7, "bold"),
+        tk.Label(ch, text="PART NUMBER / TECHNICAL DATA", font=("Segoe UI", 7, "bold"),
                 fg=self.C_FAINT, bg=self.C_PANEL, anchor="w").grid(
                     row=0, column=1, sticky="w")
         tk.Label(ch, text="QTY", font=("Segoe UI", 7, "bold"),
                 fg=self.C_FAINT, bg=self.C_PANEL, width=4).grid(row=0, column=2)
-        tk.Label(ch, text="REFS", font=("Segoe UI", 7, "bold"),
-                fg=self.C_FAINT, bg=self.C_PANEL, width=13,
-                anchor="e").grid(row=0, column=3)
 
         install_colors = self._install_colors()
         start = self.preview_start
@@ -3480,32 +3624,34 @@ class App:
             row.columnconfigure(1, weight=1)
 
             sw = self._rounded_swatch(row, color)
-            sw.grid(row=0, column=0, rowspan=2, padx=(6, 10), pady=3)
+            sw.grid(row=0, column=0, rowspan=3, padx=(6, 10), pady=3)
 
-            title = (g.comment or "—")
+            title, desc = legend_fields(g)
             if g.dni:
                 title += "  ⛔"
-            tk.Label(row, text=title, font=("Segoe UI", 10, "bold"),
+            title_label = tk.Label(row, text=title, font=("Segoe UI", 10, "bold"),
                     fg="#f87171" if g.dni else self.C_TEXT,
-                    bg=self.C_PANEL, anchor="w").grid(
-                        row=0, column=1, sticky="w", padx=(0, 4))
+                    bg=self.C_PANEL, anchor="w", width=1)
+            title_label.grid(row=0, column=1, sticky="we", padx=(0, 4))
+            self._add_tooltip(title_label, g.part_no or g.comment or "—")
 
-            desc = g.description if g.description != g.comment else ""
             if desc:
-                tk.Label(row, text=desc[:45], font=("Segoe UI", 7),
-                        fg=self.C_MUTED, bg=self.C_PANEL, anchor="w").grid(
-                            row=1, column=1, sticky="w", padx=(0, 4))
+                desc_label = tk.Label(row, text=desc if len(desc) <= 90 else desc[:89].rstrip() + "…",
+                        font=("Segoe UI", 7), fg=self.C_MUTED, bg=self.C_PANEL,
+                        anchor="w", justify="left", width=1, height=2, wraplength=250)
+                desc_label.grid(row=1, column=1, columnspan=2, sticky="we", padx=(0, 6))
+                self._add_tooltip(desc_label, desc)
 
             tk.Label(row, text=str(g.quantity), font=("Segoe UI", 12, "bold"),
                     fg=self.C_TEXT, bg=self.C_PANEL, width=4,
-                    anchor="e").grid(row=0, column=2, rowspan=2, padx=2, sticky="e")
+                    anchor="e").grid(row=0, column=2, padx=(2, 6), sticky="e")
 
             refs_short = ", ".join(g.designators[:3])
             if len(g.designators) > 3:
                 refs_short += "…"
-            refs_label = tk.Label(row, text=refs_short, font=("Segoe UI", 8),
-                    fg=self.C_MUTED, bg=self.C_PANEL, width=13, anchor="e")
-            refs_label.grid(row=0, column=3, rowspan=2, padx=(2, 6), sticky="e")
+            refs_label = tk.Label(row, text="Refs: " + refs_short, font=("Segoe UI", 8),
+                    fg=self.C_MUTED, bg=self.C_PANEL, width=1, anchor="w")
+            refs_label.grid(row=2, column=1, columnspan=2, padx=(0, 6), sticky="we", pady=(0, 3))
 
             full_refs = ", ".join(g.designators)
             if len(g.designators) > 3:
@@ -3516,8 +3662,8 @@ class App:
             self._bind_click(row, ci)
 
     def _bind_hover(self, widget, desigs):
-        widget.bind("<Enter>", lambda e, dd=desigs: self.board.highlight(dd))
-        widget.bind("<Leave>", lambda e: self.board.highlight(None))
+        widget.bind("<Enter>", lambda e, dd=desigs: self.board.highlight(dd), add="+")
+        widget.bind("<Leave>", lambda e: self.board.highlight(None), add="+")
         for ch in widget.winfo_children():
             if getattr(ch, '_skip_hover', False):
                 continue

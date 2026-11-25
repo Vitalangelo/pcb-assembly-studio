@@ -110,9 +110,9 @@ columns are worth exporting:
   `Generic` or Altium's `[NoParam],` prefix are ignored, and the Comment is
   used when no real number is there.
 
-Technical data comes from Description regardless of length. The PDF shows the
-beginning that fits the cell at the normal font size, followed by an ellipsis
-when truncated; the complete description stays in the imported data. Tab, `;` or `,`
+Technical data comes from Description regardless of length. PDF cells wrap text
+and reduce the font when needed; text that still cannot fit at the minimum size
+ends with an ellipsis. The complete description stays in the imported data. Tab, `;` or `,`
 delimiters auto-detected. DNI / DNP / "Do not place" parts are listed separately
 with a ⛔ marker and get their own PDF pages; Russian markers
 ("НЕ УСТАНАВЛИВАТЬ", "НЕ СТАВИТЬ") count too, and cp1251 files decode correctly.
@@ -135,6 +135,11 @@ colored component highlights, pin-1 markers on ICs, bottom layer auto-mirrored.
 hover REFS for the full designator list. Click a row to focus it: the rest of the
 board fades almost to white and parts too small to spot get a ring around them.
 Click the row again, click the board or press Esc to clear.
+Rows show Part number and Technical data from the same fields as the PDF, with
+references below. Hover the part number or technical text to read the full value.
+Gerber placement-area estimates affect sorting only; they do not split otherwise
+identical BOM components into separate groups. Board sides, installation stages,
+different footprints and explicit manual edits still remain separate.
 
 **Files** — the ← Files button returns to the file screen, where each loaded file
 has a ✕ to remove it. Replacing a wrong BOM no longer means restarting the app.
@@ -164,6 +169,18 @@ discards them. Reset manual order restores the selected sorting mode. Explicit
 technology and package keywords detect THT; a generic connector name alone
 does not prove its mounting type, so review uncertain parts here. Installation
 overrides and manual order are saved in `.pcbasm` projects.
+
+**Part number and Remarks** — Edit installation shows separate Part number,
+Technical data and Remarks columns. Double-click a Remarks cell or select parts
+and choose Edit remarks to enter a multiline note. Save remark updates the table;
+Apply commits all editor changes, while Cancel discards them. Clear remarks
+removes notes from the selected parts. Notes are saved in the project and appear
+in PDF Remarks alongside automatic Key/DNI labels, including on custom pages.
+Different notes intentionally create separate rows, so a note applies only to
+the specified components. The PDF designation column is one third narrower;
+Remarks gains the same width. Reference lists, part numbers, technical data and
+remarks can wrap and shrink within their cells. Very long text is marked with
+an ellipsis after the minimum font size is reached.
 
 **Exclude / Include** in Edit installation removes a selected reference from all
 assembly lists, custom pages, PDF tables and component overlays; Include restores
@@ -258,6 +275,16 @@ headers. Only the drawing changes.
 ---
 
 ## 📝 Changelog
+
+**v1.5** — Editable per-component Remarks saved in projects, with distinct
+Part number and Technical data columns in the installation editor. PDF Remarks
+gains one third of the former designation-column width. Table text wraps and
+shrinks to fit; different notes produce separate component rows. Older projects
+still open; newly saved projects require v1.5 to preserve remarks.
+
+**v1.4.4** — Preview legend and installation editor use the PDF Part number field;
+technical text has a two-line preview and full hover text. Partial or slightly
+different Gerber paste-area estimates no longer split identical BOM components.
 
 **v1.4.3** — Technical data no longer disappears for descriptions of 60 or more
 characters. The PDF displays the prefix that fits, with an ellipsis and no font
